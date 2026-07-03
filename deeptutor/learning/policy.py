@@ -29,7 +29,7 @@ from deeptutor.learning.models import (
 )
 
 # Quantitative gate for objective knowledge types: the learner must reach this
-# mastery (recency-weighted accuracy; see ``mastery.compute_mastery``) before
+# mastery (BKT posterior P(L); see ``mastery.compute_mastery``) before
 # the objective unlocks. ~0.9 mirrors Alpha School's "90% before you advance".
 QUANTITATIVE_GATE: dict[KnowledgeType, float] = {
     KnowledgeType.MEMORY: 0.9,

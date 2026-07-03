@@ -176,8 +176,8 @@ class TestGradeAndRecordFailClosed:
         assert result is True
         assert progress.quiz_attempts[0].is_correct is True
         assert progress.quiz_attempts[0].error_type is None
-        # A single correct attempt is capped at low confidence (0.5), never 1.0.
-        assert progress.mastery_levels["kp1"] == 0.5
+        # BKT posterior after one correct (concept priors: p_L0=0.1, p_G=0.25, p_S=0.15)
+        assert 0.2 < progress.mastery_levels["kp1"] < 0.5
         assert progress.error_records == []
 
     def test_correct_answer_graduates_existing_error_record(self, tmp_path):
@@ -224,7 +224,7 @@ class TestGradeAndRecordFailClosed:
         loaded = store.load("book1")
         assert loaded is not None
         assert len(loaded.quiz_attempts) == 1
-        assert loaded.mastery_levels["kp1"] == 0.5
+        assert 0.2 < loaded.mastery_levels["kp1"] < 0.5
 
     def test_scheduler_advances_repetition_and_builds_queue(self, tmp_path):
         store = LearningStore(root=tmp_path)

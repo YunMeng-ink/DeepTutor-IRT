@@ -281,3 +281,30 @@ class TestSerializationRoundtrip:
         er2 = ErrorRecord.model_validate(data)
         assert er2.error_type == ErrorType.APPLICATION_ERROR
         assert er2.status == "active"
+
+
+class TestBKTFieldsSerialization:
+    def test_bkt_params_roundtrip(self):
+        lp = LearningProgress(book_id="b1")
+        lp.bkt_params["kp1"] = {"p_L0": 0.1, "p_T": 0.3, "p_G": 0.1, "p_S": 0.1}
+        data = lp.model_dump(mode="json")
+        lp2 = LearningProgress.model_validate(data)
+        assert lp2.bkt_params["kp1"]["p_T"] == 0.3
+
+    def test_bkt_user_offsets_roundtrip(self):
+        lp = LearningProgress(book_id="b1")
+        lp.bkt_user_offsets["kp1"] = {"p_T": 0.02, "p_G": -0.01}
+        data = lp.model_dump(mode="json")
+        lp2 = LearningProgress.model_validate(data)
+        assert lp2.bkt_user_offsets["kp1"]["p_G"] == -0.01
+
+    def test_bkt_fields_default_empty(self):
+        lp = LearningProgress(book_id="b1")
+        assert lp.bkt_params == {}
+        assert lp.bkt_user_offsets == {}
+
+    def test_legacy_progress_without_bkt_fields_loads(self):
+        data = {"book_id": "b1", "current_stage": "diagnostic"}
+        lp = LearningProgress.model_validate(data)
+        assert lp.bkt_params == {}
+        assert lp.bkt_user_offsets == {}

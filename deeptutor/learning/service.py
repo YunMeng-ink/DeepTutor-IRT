@@ -19,6 +19,7 @@ from deeptutor.learning.models import (
 from deeptutor.learning.storage import LearningStore
 
 if TYPE_CHECKING:
+    from deeptutor.learning.bkt import BKTParams
     from deeptutor.learning.scheduler import SpacedRepetitionScheduler
 
 
@@ -67,6 +68,12 @@ class LearningService:
         # Clear global stage failure records — different modules should not share failure counts
         progress.stage_failure_counts = {}
         progress.stage_failure_notes = {}
+        for key in list(progress.bkt_params.keys()):
+            if key not in new_kp_ids:
+                del progress.bkt_params[key]
+        for key in list(progress.bkt_user_offsets.keys()):
+            if key not in new_kp_ids:
+                del progress.bkt_user_offsets[key]
 
         # Set new modules
         progress.modules = list(modules)
@@ -148,11 +155,61 @@ class LearningService:
         progress.updated_at = time.time()
 
     def calculate_mastery(self, progress: LearningProgress, kp_id: str) -> float:
-        """Mastery 0..1 for *kp_id* from its attempt history (policy in mastery.py)."""
+        """Mastery 0..1 for *kp_id* from its attempt history (BKT engine)."""
         correctness = [
             a.is_correct for a in progress.quiz_attempts if a.knowledge_point_id == kp_id
         ]
-        return compute_mastery(correctness)
+        bkt_params = self._resolve_bkt_params(progress, kp_id)
+        return compute_mastery(
+            correctness,
+            params=bkt_params,
+            knowledge_type=progress.knowledge_types.get(kp_id),
+        )
+
+    def _resolve_bkt_params(self, progress: LearningProgress, kp_id: str) -> BKTParams | None:
+        """Resolve effective BKT params for *kp_id* from stored state.
+
+        Returns ``None`` when no tuned params exist yet, signalling the
+        caller to fall back to global priors.
+        """
+        from deeptutor.learning.bkt import BKTGlobalPriors, BKTUserOffsetTuner
+
+        stored = progress.bkt_params.get(kp_id)
+        if not stored:
+            return None
+        kp_type = progress.knowledge_types.get(kp_id)
+        global_params = BKTGlobalPriors.get(kp_type)
+        offset = progress.bkt_user_offsets.get(kp_id, {})
+        return BKTUserOffsetTuner.apply(global_params, offset)
+
+    def _update_bkt_state(
+        self,
+        progress: LearningProgress,
+        kp_id: str,
+        is_correct: bool,
+    ) -> None:
+        """After an attempt: replay history up to before-latest, then tune offsets."""
+        from deeptutor.learning.bkt import BKTEngine, BKTGlobalPriors, BKTUserOffsetTuner
+
+        kp_type = progress.knowledge_types.get(kp_id)
+        global_params = BKTGlobalPriors.get(kp_type)
+
+        offset = progress.bkt_user_offsets.get(kp_id, {})
+        effective_params = BKTUserOffsetTuner.apply(global_params, offset)
+
+        correctness = [
+            a.is_correct for a in progress.quiz_attempts if a.knowledge_point_id == kp_id
+        ]
+        engine = BKTEngine(effective_params)
+        for c in correctness[:-1]:
+            engine.update(c)
+
+        p_L_before = engine.get_mastery()
+        new_offset = BKTUserOffsetTuner.update(offset, is_correct, p_L_before, effective_params)
+        progress.bkt_user_offsets[kp_id] = new_offset
+
+        updated_params = BKTUserOffsetTuner.apply(global_params, new_offset)
+        progress.bkt_params[kp_id] = updated_params.to_dict()
 
     def update_mastery(self, progress: LearningProgress, kp_id: str, level: float) -> None:
         progress.mastery_levels[kp_id] = level
@@ -198,6 +255,7 @@ class LearningService:
             self.update_mastery(
                 progress, knowledge_point_id, self.calculate_mastery(progress, knowledge_point_id)
             )
+            self._update_bkt_state(progress, knowledge_point_id, is_correct)
             kp_type = progress.knowledge_types.get(knowledge_point_id)
             if kp_type is not None and scheduler is not None:
                 state = progress.repetition_states.get(

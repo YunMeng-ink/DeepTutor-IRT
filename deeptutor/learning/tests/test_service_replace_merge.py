@@ -220,7 +220,7 @@ class TestReplaceModules:
         assert "kp2" not in progress.mastery_levels
 
 
-# ── mastery policy (recency-weighted with low-confidence cap) ─────────────
+# ── mastery policy (BKT posterior) ────────────────────────────────────────
 
 
 class TestMasteryPolicy:
@@ -240,34 +240,34 @@ class TestMasteryPolicy:
         service, progress = self._service_with_attempts(tmp_path, "kp1", [])
         assert service.calculate_mastery(progress, "kp1") == 0.0
 
-    def test_single_correct_attempt_is_capped_at_half(self, tmp_path: Path):
-        """One lucky correct answer cannot declare a point mastered."""
+    def test_single_correct_attempt(self, tmp_path: Path):
+        """BKT: one correct answer with concept priors gives P(L) ≈ 0.347."""
         service, progress = self._service_with_attempts(tmp_path, "kp1", [True])
-        assert service.calculate_mastery(progress, "kp1") == 0.5
+        score = service.calculate_mastery(progress, "kp1")
+        assert 0.2 < score < 0.5
 
-    def test_single_wrong_attempt_is_zero(self, tmp_path: Path):
+    def test_single_wrong_attempt(self, tmp_path: Path):
         service, progress = self._service_with_attempts(tmp_path, "kp1", [False])
-        assert service.calculate_mastery(progress, "kp1") == 0.0
+        score = service.calculate_mastery(progress, "kp1")
+        assert score < 0.15
 
-    def test_two_correct_attempts_capped_at_point_eight(self, tmp_path: Path):
-        service, progress = self._service_with_attempts(tmp_path, "kp1", [True, True])
-        assert service.calculate_mastery(progress, "kp1") == 0.8
-
-    def test_three_plus_correct_can_reach_one(self, tmp_path: Path):
+    def test_three_correct_exceeds_gate(self, tmp_path: Path):
         service, progress = self._service_with_attempts(tmp_path, "kp1", [True, True, True])
-        assert service.calculate_mastery(progress, "kp1") == 1.0
+        score = service.calculate_mastery(progress, "kp1")
+        assert score > 0.9
 
-    def test_more_correct_attempts_score_higher_once_uncapped(self, tmp_path: Path):
-        """With enough evidence (3+ attempts) the cap lifts, so a mostly-correct
-        history scores strictly higher than a mostly-wrong one."""
-        mostly_right, p_right = self._service_with_attempts(tmp_path, "kp1", [True, True, False])
-        mostly_wrong, p_wrong = self._service_with_attempts(tmp_path, "kp2", [False, False, True])
+    def test_more_correct_attempts_score_higher(self, tmp_path: Path):
+        """A mostly-correct history scores strictly higher than a mostly-wrong one."""
+        mostly_right, p_right = self._service_with_attempts(
+            tmp_path, "kp1", [True, True, True, True, False]
+        )
+        mostly_wrong, p_wrong = self._service_with_attempts(
+            tmp_path, "kp2", [False, False, False, True, False]
+        )
 
         right_score = mostly_right.calculate_mastery(p_right, "kp1")
         wrong_score = mostly_wrong.calculate_mastery(p_wrong, "kp2")
 
-        # Three attempts with two correct clears the single-attempt cap of 0.5.
-        assert right_score > 0.5
         assert right_score > wrong_score
 
 
@@ -297,8 +297,8 @@ class TestGradeAndRecord:
         assert result is True
         assert len(progress.quiz_attempts) == 1
         assert progress.quiz_attempts[0].is_correct is True
-        # A single correct attempt is capped at 0.5 by the mastery policy.
-        assert progress.mastery_levels["kp1"] == 0.5
+        # BKT posterior after one correct (concept priors) ≈ 0.347
+        assert 0.2 < progress.mastery_levels["kp1"] < 0.5
         # Pipeline persists.
         loaded = store.load("book1")
         assert loaded is not None

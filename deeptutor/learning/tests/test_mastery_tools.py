@@ -149,7 +149,7 @@ async def test_quiz_then_grade_drives_memory_gate(path_id):
         result = json.loads((await grade.execute(_mastery_path_id=path_id, answer="4")).content)
         assert result["is_correct"] is True
         mastered = result["mastered"]
-    # 0.5 -> 0.8 -> 1.0 ≥ 0.9: mastered only after the third correct answer.
+    # memory type (p_L0=0.1, p_T=0.3): 3 correct → P(L) ≈ 0.997 ≥ 0.9.
     assert mastered is True
 
 

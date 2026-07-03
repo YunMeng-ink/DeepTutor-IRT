@@ -263,6 +263,8 @@ class TestRedoProgress:
         assert prog["mastery_levels"] == {}
         assert prog["quiz_attempts"] == []
         assert prog["error_records"] == []
+        assert prog["bkt_params"] == {}
+        assert prog["bkt_user_offsets"] == {}
         assert prog["diagnostic"] is None
         assert prog["current_kp_index"] == 0
         # Modules survive a redo so the learner can restart the same path.
