@@ -93,6 +93,7 @@ class RetentionScheduler(Protocol):
         kp_id: str,
         *,
         now: float | None = None,
+        error_kps: set[str] | None = None,
     ) -> float: ...
 
     def build_review_queue(
@@ -346,6 +347,7 @@ class SpacedRepetitionScheduler:
         kp_id: str,
         *,
         now: float | None = None,
+        error_kps: set[str] | None = None,
     ) -> float:
         moment = time.time() if now is None else now
         recall = self.retrievability(state, now=moment)
@@ -353,7 +355,7 @@ class SpacedRepetitionScheduler:
         if moment > state.next_review_at:
             overdue_days = (moment - state.next_review_at) / self._seconds_per_unit()
             risk += min(overdue_days / 7.0, 0.25)
-        if kp_id in _error_kp_ids(progress):
+        if kp_id in (error_kps if error_kps is not None else _error_kp_ids(progress)):
             risk += 0.2
         if state.lapse_count:
             risk += min(0.1 * state.lapse_count, 0.2)
@@ -367,6 +369,7 @@ class SpacedRepetitionScheduler:
         *,
         now: float | None = None,
         latest_evidence: LearningEvidence | None = None,
+        error_kps: set[str] | None = None,
     ) -> str:
         moment = time.time() if now is None else now
         unit = self._seconds_per_unit()
@@ -378,13 +381,15 @@ class SpacedRepetitionScheduler:
         elif delta >= 0:
             parts.append("due now")
         else:
-            parts.append(f"due in {_format_span(-delta / unit)}")
+            parts.append(f"due in {_format_span(-delta)}")
         desired = state.desired_retention or DEFAULT_DESIRED_RETENTION
         if recall + 1e-9 < desired:
             parts.append(f"retrievability {recall:.0%} below {desired:.0%} target")
         else:
             parts.append(f"retrievability {recall:.0%}")
-        failures = state.consecutive_wrong + (1 if kp_id in _error_kp_ids(progress) else 0)
+        failures = state.consecutive_wrong + (
+            1 if kp_id in (error_kps if error_kps is not None else _error_kp_ids(progress)) else 0
+        )
         if state.lapse_count:
             parts.append(f"{state.lapse_count} lapse{'s' if state.lapse_count != 1 else ''}")
         elif failures:
@@ -416,7 +421,7 @@ class SpacedRepetitionScheduler:
             kp_type = progress.knowledge_types.get(kp_id, KnowledgeType.MEMORY)
             self.hydrate(state, kp_type)
             priority = 1 if kp_id in error_kps else _TYPE_PRIORITY[kp_type]
-            risk = self.forgetting_risk(state, progress, kp_id, now=moment)
+            risk = self.forgetting_risk(state, progress, kp_id, now=moment, error_kps=error_kps)
             evidence = latest_evidence.get(kp_id)
             tasks.append(
                 ReviewTask(
@@ -428,7 +433,12 @@ class SpacedRepetitionScheduler:
                     state=state,
                     forgetting_risk=round(risk, 4),
                     reason=self.review_reason(
-                        state, progress, kp_id, now=moment, latest_evidence=evidence
+                        state,
+                        progress,
+                        kp_id,
+                        now=moment,
+                        latest_evidence=evidence,
+                        error_kps=error_kps,
                     ),
                     evidence_source=evidence.source if evidence is not None else "",
                     evidence_id=evidence.evidence_id if evidence is not None else "",

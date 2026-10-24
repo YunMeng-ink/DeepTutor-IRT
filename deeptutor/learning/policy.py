@@ -18,21 +18,24 @@ reads proven mastery, not a fixed sequence of stages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 from deeptutor.learning.models import (
     KnowledgePoint,
     KnowledgeType,
+    LearningEvidence,
     LearningProgress,
+    QuizAttempt,
     RepetitionState,
     ReviewTask,
 )
 from deeptutor.learning.pending import PublicPendingQuestion, public_pending_question
 
 # Quantitative gate for objective knowledge types: the learner must reach this
-# mastery (recency-weighted accuracy; see ``mastery.compute_mastery``) before
-# the objective unlocks. ~0.9 mirrors Alpha School's "90% before you advance".
+# mastery (an IRT-3PL ability estimate read as expected accuracy; see
+# ``mastery.compute_mastery``) before the objective unlocks. ~0.9 mirrors
+# Alpha School's "90% before you advance".
 QUANTITATIVE_GATE: dict[KnowledgeType, float] = {
     KnowledgeType.MEMORY: 0.9,
     KnowledgeType.PROCEDURE: 0.9,
@@ -71,6 +74,58 @@ def path_display_name(progress: LearningProgress) -> str:
     return first_module or progress.book_id
 
 
+@dataclass(frozen=True)
+class ProgressFacts:
+    """One-pass grouping of a path's attempt and evidence history by objective.
+
+    Whole-map reads (``map_summary``, ``next_objective``, the tutor's status
+    tool) ask about every objective; grouping once with
+    :func:`progress_facts` makes that O(objectives + records) instead of
+    rescanning the full history per objective. The grouped records are the
+    same objects the aggregate holds — facts are an index, not a snapshot.
+    """
+
+    #: Non-voided attempts per knowledge point (what ``learning_stage`` reads).
+    attempts: dict[str, list[QuizAttempt]] = field(default_factory=dict)
+    #: Knowledge points with any attempt at all, voided included (what makes
+    #: an objective "seen" for ``objective_status``).
+    seen: frozenset[str] = frozenset()
+    #: Evidence events per knowledge point.
+    evidence: dict[str, list[LearningEvidence]] = field(default_factory=dict)
+    #: Source-verified visual task names per knowledge point.
+    verified_tasks: dict[str, frozenset[str]] = field(default_factory=dict)
+
+
+def progress_facts(progress: LearningProgress) -> ProgressFacts:
+    """Group a path's history by objective in one pass over each record."""
+    attempts: dict[str, list[QuizAttempt]] = {}
+    seen: set[str] = set()
+    for attempt in progress.quiz_attempts:
+        kp_id = attempt.knowledge_point_id
+        seen.add(kp_id)
+        if not attempt.voided:
+            attempts.setdefault(kp_id, []).append(attempt)
+    evidence: dict[str, list[LearningEvidence]] = {}
+    verified: dict[str, set[str]] = {}
+    for event in progress.learning_evidence:
+        kp_id = event.knowledge_point_id
+        evidence.setdefault(kp_id, []).append(event)
+        task = event.visual_context.get("task")
+        if (
+            event.result == "correct"
+            and task
+            and event.visual_context.get("key_status") == "verified"
+            and not event.hints_used
+        ):
+            verified.setdefault(kp_id, set()).add(task)
+    return ProgressFacts(
+        attempts=attempts,
+        seen=frozenset(seen),
+        evidence=evidence,
+        verified_tasks={kp_id: frozenset(tasks) for kp_id, tasks in verified.items()},
+    )
+
+
 def gate_threshold(kp_type: KnowledgeType) -> float:
     """The quantitative mastery bar for *kp_type* (qualitative types report
     their pass-display value so callers have a single number to show)."""
@@ -79,13 +134,19 @@ def gate_threshold(kp_type: KnowledgeType) -> float:
     return QUANTITATIVE_GATE.get(kp_type, 0.9)
 
 
-def is_assessed_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
+def is_assessed_mastered(
+    progress: LearningProgress,
+    kp: KnowledgePoint,
+    *,
+    facts: ProgressFacts | None = None,
+) -> bool:
     """Whether ``kp`` clears its mastery gate.
 
-    * MEMORY / PROCEDURE: recency-weighted accuracy ≥ the type's threshold.
+    * MEMORY / PROCEDURE: IRT-estimated mastery ≥ the type's threshold.
     * CONCEPT / DESIGN: a recorded qualitative pass (``mastery_assess``).
     """
-    if not set(kp.required_visual_tasks).issubset(visual_achievements(progress, kp.id)):
+    facts = facts or progress_facts(progress)
+    if not set(kp.required_visual_tasks).issubset(facts.verified_tasks.get(kp.id, frozenset())):
         return False
     if kp.type in QUALITATIVE_TYPES:
         return bool(progress.qualitative_mastery.get(kp.id, False))
@@ -94,26 +155,18 @@ def is_assessed_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool
 
 def visual_achievements(progress: LearningProgress, kp_id: str) -> list[str]:
     """Independent source-verified visual tasks, separate from generic text scores."""
-    return sorted(
-        {
-            event.visual_context["task"]
-            for event in progress.learning_evidence
-            if event.knowledge_point_id == kp_id
-            and event.result == "correct"
-            and event.visual_context.get("task")
-            and event.visual_context.get("key_status") == "verified"
-            and not event.hints_used
-        }
-    )
+    return sorted(progress_facts(progress).verified_tasks.get(kp_id, frozenset()))
 
 
-def learning_stage(progress: LearningProgress, kp_id: str) -> str:
-    attempts = [
-        item
-        for item in progress.quiz_attempts
-        if item.knowledge_point_id == kp_id and not item.voided
-    ]
-    evidence = [item for item in progress.learning_evidence if item.knowledge_point_id == kp_id]
+def learning_stage(
+    progress: LearningProgress,
+    kp_id: str,
+    *,
+    facts: ProgressFacts | None = None,
+) -> str:
+    facts = facts or progress_facts(progress)
+    attempts = facts.attempts.get(kp_id, [])
+    evidence = facts.evidence.get(kp_id, [])
     if any(item.independent and item.is_correct for item in attempts) or any(
         item.assessment_type == "qualitative" and item.result == "correct" and not item.hints_used
         for item in evidence
@@ -137,17 +190,27 @@ def learning_stage(progress: LearningProgress, kp_id: str) -> str:
     return "teaching_record_unverified"
 
 
-def mastery_source(progress: LearningProgress, kp: KnowledgePoint) -> str:
+def mastery_source(
+    progress: LearningProgress,
+    kp: KnowledgePoint,
+    *,
+    facts: ProgressFacts | None = None,
+) -> str:
     """Return ``system`` or ``learner`` provenance for a cleared waypoint."""
 
-    if is_assessed_mastered(progress, kp):
+    if is_assessed_mastered(progress, kp, facts=facts):
         return "system"
     if kp.id in progress.learner_mastery_overrides:
         return "learner"
     return ""
 
 
-def is_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
+def is_mastered(
+    progress: LearningProgress,
+    kp: KnowledgePoint,
+    *,
+    facts: ProgressFacts | None = None,
+) -> bool:
     """Whether the route may advance past ``kp``.
 
     The deterministic assessed gate remains available through
@@ -155,24 +218,28 @@ def is_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
     route, but every public report exposes that different provenance.
     """
 
-    return bool(mastery_source(progress, kp))
+    return bool(mastery_source(progress, kp, facts=facts))
 
 
 def display_mastery(progress: LearningProgress, kp: KnowledgePoint) -> float:
     """A 0..1 number for the map UI. Qualitatively-mastered points show full;
-    otherwise the recency-weighted accuracy stands in."""
+    otherwise the estimated mastery stands in."""
     if kp.type in QUALITATIVE_TYPES and progress.qualitative_mastery.get(kp.id):
         return _QUALITATIVE_PASS_DISPLAY
     return float(progress.mastery_levels.get(kp.id, 0.0))
 
 
-def objective_status(progress: LearningProgress, kp: KnowledgePoint) -> str:
+def objective_status(
+    progress: LearningProgress,
+    kp: KnowledgePoint,
+    *,
+    facts: ProgressFacts | None = None,
+) -> str:
     """``"mastered"`` | ``"learning"`` | ``"new"`` for one knowledge point."""
-    if is_mastered(progress, kp):
+    if is_mastered(progress, kp, facts=facts):
         return "mastered"
-    seen = any(a.knowledge_point_id == kp.id for a in progress.quiz_attempts) or (
-        kp.id in progress.qualitative_mastery
-    )
+    facts = facts or progress_facts(progress)
+    seen = kp.id in facts.seen or (kp.id in progress.qualitative_mastery)
     return "learning" if seen else "new"
 
 
@@ -277,6 +344,7 @@ def next_objective(
        the cursor — mastered objectives are skipped);
     4. otherwise the path is complete.
     """
+    facts = progress_facts(progress)
     pending = progress.pending_question
     if pending is not None:
         kp, module_id, module_name = find_knowledge_point(progress, pending.knowledge_point_id)
@@ -287,7 +355,7 @@ def next_objective(
             knowledge_point_id=pending.knowledge_point_id,
             knowledge_point_name=kp.name if kp else "",
             knowledge_point_type=kp.type.value if kp else "",
-            status=objective_status(progress, kp) if kp else "learning",
+            status=objective_status(progress, kp, facts=facts) if kp else "learning",
             gate=gate_kind(kp) if kp else "",
             mastery=display_mastery(progress, kp) if kp else 0.0,
             threshold=gate_threshold(kp.type) if kp else 0.0,
@@ -314,7 +382,7 @@ def next_objective(
                 knowledge_point_id=kp.id,
                 knowledge_point_name=kp.name,
                 knowledge_point_type=kp.type.value,
-                status=objective_status(progress, kp),
+                status=objective_status(progress, kp, facts=facts),
                 gate=gate_kind(kp),
                 mastery=display_mastery(progress, kp),
                 threshold=gate_threshold(kp.type),
@@ -325,9 +393,9 @@ def next_objective(
     deferred_fallback: NextStep | None = None
     for module in sorted(progress.modules, key=lambda m: m.order):
         for kp in module.knowledge_points:
-            if is_mastered(progress, kp):
+            if is_mastered(progress, kp, facts=facts):
                 continue
-            status = objective_status(progress, kp)
+            status = objective_status(progress, kp, facts=facts)
             gate = gate_kind(kp)
             if status == "new":
                 action = (
@@ -376,13 +444,14 @@ def next_objective(
 def map_summary(progress: LearningProgress, *, now: float | None = None) -> dict:
     """A compact, render-ready snapshot of the whole path for the tutor's
     ``mastery_status`` tool and the dashboard."""
+    facts = progress_facts(progress)
     counts = {"mastered": 0, "learning": 0, "new": 0, "total": 0}
     modules_out: list[dict] = []
     for module in sorted(progress.modules, key=lambda m: m.order):
         kps_out: list[dict] = []
         mastered = 0
         for kp in module.knowledge_points:
-            status = objective_status(progress, kp)
+            status = objective_status(progress, kp, facts=facts)
             counts[status] += 1
             counts["total"] += 1
             if status == "mastered":
@@ -396,7 +465,7 @@ def map_summary(progress: LearningProgress, *, now: float | None = None) -> dict
                     "topic_source_ids": list(kp.topic_source_ids),
                     "status": status,
                     "mastery": round(display_mastery(progress, kp), 3),
-                    "mastery_source": mastery_source(progress, kp),
+                    "mastery_source": mastery_source(progress, kp, facts=facts),
                     "override_note": (
                         progress.learner_mastery_overrides[kp.id].note
                         if kp.id in progress.learner_mastery_overrides
@@ -505,17 +574,18 @@ def objective_report(
         None,
     )
     moment = time.time() if now is None else now
+    facts = progress_facts(progress)
     return {
         "id": kp.id,
         "name": kp.name,
         "type": kp.type.value,
         "module_id": module_id,
         "module_name": module_name,
-        "status": objective_status(progress, kp),
+        "status": objective_status(progress, kp, facts=facts),
         "gate": gate_kind(kp),
-        "mastered": is_mastered(progress, kp),
-        "assessed_mastered": is_assessed_mastered(progress, kp),
-        "mastery_source": mastery_source(progress, kp),
+        "mastered": is_mastered(progress, kp, facts=facts),
+        "assessed_mastered": is_assessed_mastered(progress, kp, facts=facts),
+        "mastery_source": mastery_source(progress, kp, facts=facts),
         "override_note": (
             progress.learner_mastery_overrides[kp_id].note
             if kp_id in progress.learner_mastery_overrides
@@ -529,7 +599,7 @@ def objective_report(
         "explanation": progress.feynman_explanations.get(kp_id, ""),
         "explained": progress.explained_objectives.get(kp_id),
         "required_visual_tasks": kp.required_visual_tasks,
-        "demonstrated_visual_tasks": visual_achievements(progress, kp_id),
+        "demonstrated_visual_tasks": sorted(facts.verified_tasks.get(kp_id, frozenset())),
         "review": _review_report(progress, kp_id, state, due_at, now=moment),
         "errors": [
             {
@@ -550,6 +620,7 @@ __all__ = [
     "QUANTITATIVE_GATE",
     "QUALITATIVE_TYPES",
     "NextStep",
+    "ProgressFacts",
     "gate_kind",
     "gate_threshold",
     "is_assessed_mastered",
@@ -563,4 +634,5 @@ __all__ = [
     "next_objective",
     "map_summary",
     "path_display_name",
+    "progress_facts",
 ]

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from deeptutor.learning.grading import classify_error, grade_answer
+from deeptutor.learning.irt import GUESSING_DEFAULT, IrtItem, item_from_labels
 from deeptutor.learning.mastery import compute_mastery
 from deeptutor.learning.models import (
     DeferredObjective,
@@ -521,12 +522,24 @@ class LearningService:
 
     def calculate_mastery(self, progress: LearningProgress, kp_id: str) -> float:
         """Mastery 0..1 for *kp_id* from its attempt history (policy in mastery.py)."""
-        correctness = [
-            0.5 if a.result == "partial" else a.is_correct
+        attempts = [
+            a
             for a in progress.quiz_attempts
             if a.knowledge_point_id == kp_id and not a.voided and a.independent
         ]
-        return compute_mastery(correctness)
+        correctness = [0.5 if a.result == "partial" else a.is_correct for a in attempts]
+        # Attempts recorded with the posed question's parameters carry them;
+        # the rest score as unknown (default medium) items.
+        items = [
+            IrtItem(
+                b=a.item_difficulty if a.item_difficulty is not None else 0.0,
+                c=a.item_guessing if a.item_guessing is not None else GUESSING_DEFAULT,
+            )
+            if a.item_difficulty is not None or a.item_guessing is not None
+            else None
+            for a in attempts
+        ]
+        return compute_mastery(correctness, items)
 
     def update_mastery(self, progress: LearningProgress, kp_id: str, level: float) -> None:
         progress.mastery_levels[kp_id] = level
@@ -588,6 +601,7 @@ class LearningService:
         visual_context: dict[str, Any] | None = None,
         assistance_used: bool = False,
         verdict: dict[str, Any] | None = None,
+        irt_item: IrtItem | None = None,
     ) -> bool:
         """Mutate one aggregate with a grade without performing I/O."""
         is_correct = (
@@ -619,6 +633,8 @@ class LearningService:
                 else classify_error(user_answer),
                 independent=not assistance_used and not (visual_context or {}).get("hints_used"),
                 visual_context=visual_context or {},
+                item_difficulty=irt_item.b if irt_item is not None else None,
+                item_guessing=irt_item.c if irt_item is not None else None,
             ),
         )
         evidence = None
@@ -1674,6 +1690,11 @@ class LearningService:
                 visual_context=pending.visual_context,
                 assistance_used=pending.assistance_used,
                 verdict=verdict,
+                irt_item=item_from_labels(
+                    pending.difficulty,
+                    pending.question_type,
+                    len(pending.options),
+                ),
             )
         )
         if verdict:

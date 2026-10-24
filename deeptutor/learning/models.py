@@ -138,6 +138,14 @@ class QuizAttempt(BaseModel):
     void_reason: str = ""
     independent: bool = True
     visual_context: dict[str, Any] = Field(default_factory=dict)
+    # IRT-3PL item parameters captured when the question was posed (see
+    # ``learning.irt``): ``item_difficulty`` is the b parameter derived from
+    # the question's difficulty badge, ``item_guessing`` the c floor derived
+    # from its type. ``None`` on every attempt recorded before IRT scoring —
+    # and on answers graded without difficulty metadata — reads as "unknown
+    # item", and scoring falls back to the default medium item.
+    item_difficulty: float | None = None
+    item_guessing: float | None = None
 
     @model_validator(mode="after")
     def _legacy_result(self):

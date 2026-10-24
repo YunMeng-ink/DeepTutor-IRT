@@ -447,17 +447,21 @@ class TestMasteryPolicy:
         service, progress = self._service_with_attempts(tmp_path, "kp1", [True])
         assert service.calculate_mastery(progress, "kp1") == 0.5
 
-    def test_single_wrong_attempt_is_zero(self, tmp_path: Path):
+    def test_single_wrong_attempt_scores_low(self, tmp_path: Path):
+        """A single miss is thin evidence, not proof of zero ability: the IRT
+        estimate lands low and far below every gate."""
         service, progress = self._service_with_attempts(tmp_path, "kp1", [False])
-        assert service.calculate_mastery(progress, "kp1") == 0.0
+        assert 0.0 < service.calculate_mastery(progress, "kp1") < 0.4
 
     def test_two_correct_attempts_capped_at_point_eight(self, tmp_path: Path):
         service, progress = self._service_with_attempts(tmp_path, "kp1", [True, True])
         assert service.calculate_mastery(progress, "kp1") == 0.8
 
-    def test_three_plus_correct_can_reach_one(self, tmp_path: Path):
+    def test_three_plus_correct_clears_the_gate(self, tmp_path: Path):
+        """Three correct answers estimate enough ability to clear the 0.9
+        gate; IRT scoring never awards certainty 1.0 from finite evidence."""
         service, progress = self._service_with_attempts(tmp_path, "kp1", [True, True, True])
-        assert service.calculate_mastery(progress, "kp1") == 1.0
+        assert service.calculate_mastery(progress, "kp1") >= 0.9
 
     def test_more_correct_attempts_score_higher_once_uncapped(self, tmp_path: Path):
         """With enough evidence (3+ attempts) the cap lifts, so a mostly-correct

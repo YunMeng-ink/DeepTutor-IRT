@@ -77,7 +77,7 @@ from deeptutor.learning.policy import (
     map_summary,
     next_objective,
     path_display_name,
-    visual_achievements,
+    progress_facts,
 )
 from deeptutor.learning.question_card import (
     QUESTION_CARD_KEY,
@@ -837,6 +837,10 @@ class MasteryStatusTool(BaseTool):
                 },
                 meta_key="mastery_status",
             )
+        # One grouping pass shared by both per-objective projections, so a
+        # status read touches each attempt/evidence record once however large
+        # the path's history has grown.
+        facts = progress_facts(progress)
         payload = {
             "status": "active",
             "path_revision": progress.version,
@@ -851,22 +855,18 @@ class MasteryStatusTool(BaseTool):
             "map": map_summary(progress),
             **_profile_status(progress, include_teaching_history=include_history),
             "learning_stages": {
-                kp.id: learning_stage(progress, kp.id)
+                kp.id: learning_stage(progress, kp.id, facts=facts)
                 for module in progress.modules
                 for kp in module.knowledge_points
-            }
-            if progress
-            else {},
+            },
             "visual_requirements": {
                 kp.id: {
                     "required": kp.required_visual_tasks,
-                    "demonstrated": visual_achievements(progress, kp.id),
+                    "demonstrated": sorted(facts.verified_tasks.get(kp.id, frozenset())),
                 }
                 for module in progress.modules
                 for kp in module.knowledge_points
-            }
-            if progress
-            else {},
+            },
         }
         interaction = service.store.get_active_interaction(path_id)
         if interaction is not None:

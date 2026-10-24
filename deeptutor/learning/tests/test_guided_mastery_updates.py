@@ -50,10 +50,16 @@ def test_compute_mastery_single_correct_is_capped_at_half():
 
 
 def test_compute_mastery_cap_progression():
-    """Cap relaxes as evidence accumulates: 1->0.5, 2->0.8, 3+->up to 1.0."""
+    """Cap relaxes as evidence accumulates: 1->0.5, 2->0.8, 3+ clears the gate.
+
+    Under IRT scoring finite evidence never yields certainty 1.0 — three
+    correct answers estimate enough ability to clear the 0.9 gate, and the
+    score keeps climbing as more evidence lands.
+    """
     assert compute_mastery([True]) == 0.5
     assert compute_mastery([True, True]) == 0.8
-    assert compute_mastery([True, True, True]) == pytest.approx(1.0)
+    assert compute_mastery([True, True, True]) >= 0.9
+    assert compute_mastery([True] * 5) > compute_mastery([True, True, True])
 
 
 def test_compute_mastery_empty_is_zero():
@@ -77,8 +83,8 @@ def test_compute_mastery_weighs_recent_attempts_more_heavily():
     recovering = compute_mastery([False, True, True])
     declining = compute_mastery([True, True, False])
     assert recovering > declining
-    assert recovering == pytest.approx(0.696, abs=1e-3)
-    assert declining == pytest.approx(0.643, abs=1e-3)
+    assert recovering == pytest.approx(0.664, abs=1e-3)
+    assert declining == pytest.approx(0.599, abs=1e-3)
 
 
 # ── grade_and_record: the unified post-answer pipeline ─────────────────────

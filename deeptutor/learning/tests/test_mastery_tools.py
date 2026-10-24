@@ -315,12 +315,14 @@ async def test_grade_on_a_qualitative_objective_sends_the_tutor_to_assess(path_i
         )
         assert payload["is_correct"] is True
 
-    # Three correct answers and the gate is still shut — by design, not by bug.
+    # Three correct answers push quiz mastery high — and the gate is still
+    # shut, by design, not by bug. Quiz mastery is an IRT estimate: it can
+    # climb past the quantitative bar's neighbourhood but a qualitative
+    # objective clears only through a judged explanation (mastery_assess).
     assert payload["mastered"] is False
     assert payload["gate"] == "qualitative"
-    # Which is only an interpretable reading next to the gate it is read
-    # against: on its own, mastery 1.0 against threshold 1.0 says "cleared".
-    assert payload["mastery"] == payload["threshold"] == 1.0
+    assert payload["mastery"] >= 0.9
+    assert payload["threshold"] == 1.0
     # ``next`` is the path-wide cursor, not a verdict on the objective just
     # graded — here it still points at the untouched memory objective ahead of
     # this one. Which is exactly why the instruction has to carry the way

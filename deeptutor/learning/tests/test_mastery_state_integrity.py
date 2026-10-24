@@ -408,7 +408,7 @@ def test_void_invalid_question_recomputes_mastery_and_review(tmp_path):
     before = store.load("book1")
     assert before is not None
     assert before.quiz_attempts[0].is_correct is False
-    assert before.mastery_levels["kp1"] == 0.0
+    assert 0.0 < before.mastery_levels["kp1"] < 0.4
     assert before.error_records
 
     progress, details = service.repair_question(
@@ -493,7 +493,7 @@ def test_correct_answer_key_regrades_and_restores_mastery(tmp_path):
     assert details["is_correct"] is True
     assert progress.quiz_attempts[0].is_correct is True
     assert progress.quiz_attempts[0].voided is False
-    assert progress.mastery_levels["kp1"] == 1.0
+    assert progress.mastery_levels["kp1"] >= 0.9
     assert all(
         record.status == "graduated"
         for record in progress.error_records
