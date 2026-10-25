@@ -234,6 +234,63 @@ def test_sidecar_unknown_content_is_preserved_or_rejected(tmp_path: Path) -> Non
 
 
 @REQUIRES_LIGHTRAG
+def test_sidecar_unrecoverable_table_keeps_caption_and_document(tmp_path: Path) -> None:
+    """A scan's table whose body OCR could not recover must not cost the whole
+    document: the caption survives as text and mapping continues."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "blocks.json").write_text(
+        json.dumps(
+            [
+                {"type": "table", "table_caption": ["表 2-1 CRC 校验码"], "page_idx": 3},
+                {"type": "text", "text": "content after the broken table"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest = {
+        "canonical_filename": "doc.pdf",
+        "parser": {"engine": "mineru", "parser_signature": "s"},
+        "blocks": {"path": "blocks.json"},
+        "assets": [],
+    }
+
+    document = sidecar.build_ir(manifest, bundle)
+
+    assert not any(block.tables for block in document.blocks)
+    assert any("表 2-1 CRC 校验码" in block.content_template for block in document.blocks)
+    assert any(
+        "content after the broken table" in block.content_template for block in document.blocks
+    )
+
+
+@REQUIRES_LIGHTRAG
+def test_sidecar_unrecoverable_table_without_caption_is_dropped(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "blocks.json").write_text(
+        json.dumps(
+            [
+                {"type": "table", "rows": [], "page_idx": 3},
+                {"type": "text", "text": "still here"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest = {
+        "canonical_filename": "doc.pdf",
+        "parser": {"engine": "mineru", "parser_signature": "s"},
+        "blocks": {"path": "blocks.json"},
+        "assets": [],
+    }
+
+    document = sidecar.build_ir(manifest, bundle)
+
+    assert not any(block.tables for block in document.blocks)
+    assert any("still here" in block.content_template for block in document.blocks)
+
+
+@REQUIRES_LIGHTRAG
 def test_sidecar_asset_traversal_is_rejected(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class SidecarMappingError(ValueError):
@@ -226,7 +229,23 @@ def build_ir(manifest: dict[str, Any], bundle: Path):
                 body.strip() if isinstance(body, str) and "<table" in body.lower() else None
             )
             if not table_rows and not table_html:
-                raise SidecarMappingError(f"Structured table {index} has no usable body")
+                # The source parse says a table lives here but its body could
+                # not be recovered — ordinary for scans, where OCR sometimes
+                # recognizes the table region without its cells. The content
+                # is already lost upstream; failing the whole document would
+                # only throw away the pages around it. Keep whatever caption
+                # or footnotes survived and continue without a table
+                # placeholder (no IR reference can dangle).
+                logger.warning(
+                    "Sidecar mapping: structured table %d has no usable body; "
+                    "keeping its caption and footnotes only",
+                    index,
+                )
+                caption = _caption(item, "table_caption")
+                if caption:
+                    current_lines.append(caption)
+                current_lines.extend(_strings(item.get("table_footnote") or item.get("footnotes")))
+                continue
             key = next_key("tb")
             current_tables.append(
                 IRTable(
