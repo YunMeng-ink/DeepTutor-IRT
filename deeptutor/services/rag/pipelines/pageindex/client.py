@@ -124,12 +124,26 @@ class PageIndexClient:
         return cls(local_type(storage_path=str(storage_path)))
 
     async def submit_document(self, file_path: str | Path, *, mode: str | None = None) -> str:
-        result = await asyncio.to_thread(
-            self.sdk_client.submit_document,
-            str(file_path),
-            mode=mode,
-            wait=True,
-        )
+        from pageindex.errors import PageIndexAPIError
+
+        try:
+            result = await asyncio.to_thread(
+                self.sdk_client.submit_document,
+                str(file_path),
+                mode=mode,
+                wait=True,
+            )
+        except PageIndexAPIError as exc:
+            if "All pages are blank" in str(exc):
+                # The SDK rejected the PDF before indexing because no page
+                # yields text. Say what to do about it instead of leaking the
+                # SDK's bare wording.
+                raise RuntimeError(
+                    f"{Path(file_path).name}: the PDF has no text layer (every page reads as "
+                    "blank — typically a scanned document). PageIndex cannot index scanned "
+                    "PDFs; run OCR on the file first or index it with a different RAG engine."
+                ) from exc
+            raise
         doc_id = result.get("doc_id") if isinstance(result, dict) else None
         if not doc_id:
             raise RuntimeError(f"PageIndex submit_document returned no doc_id: {result!r}")

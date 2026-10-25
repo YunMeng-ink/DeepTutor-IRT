@@ -127,6 +127,40 @@ def test_add_documents_appends_to_manifest(tmp_path) -> None:
     assert set(_manifest(tmp_path, "kb")["docs"]) == {"a.pdf", "b.pdf"}
 
 
+def test_add_documents_on_empty_kb_cleans_up_after_failure(tmp_path) -> None:
+    """A failed first add must leave no half-built version dir behind — the
+    leftover would flip every retry to "reindex required"."""
+
+    class FailingClient(FakeClient):
+        async def submit_document(self, file_path, *, mode=None) -> str:
+            raise RuntimeError("boom")
+
+    pipe = _pipe(tmp_path, FailingClient())
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_text("x")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(pipe.add_documents("kb", [str(pdf)]))
+
+    assert not any((tmp_path / "kb").glob("version-*"))
+    # And the KB is still bootstrap-able: the retry takes the fresh-dir path
+    # again instead of tripping over the corpse of the failed one.
+    ok = asyncio.run(_pipe(tmp_path, FakeClient()).add_documents("kb", [str(pdf)]))
+    assert ok is True
+
+
+def test_add_documents_on_empty_kb_without_supported_files_cleans_up(tmp_path) -> None:
+    client = FakeClient()
+    pipe = _pipe(tmp_path, client)
+    png = tmp_path / "c.png"
+    png.write_text("z")
+
+    assert asyncio.run(pipe.add_documents("kb", [str(png)])) is False
+
+    assert client.submitted == []
+    assert not any((tmp_path / "kb").glob("version-*"))
+
+
 def test_oss_accepts_pdf_only_and_forwards_explicit_mode(tmp_path, monkeypatch) -> None:
     client = FakeClient()
     pipe = PageIndexPipeline(
@@ -294,6 +328,35 @@ def test_submit_document_uses_sdk_wait() -> None:
 
     assert doc_id == "doc-1"
     assert calls == [("a.pdf", "flash", True)]
+
+
+def test_submit_document_translates_blank_pdf_rejection() -> None:
+    """A scanned PDF rejected by the SDK must fail with actionable wording,
+    not the SDK's bare "All pages are blank"."""
+    from pageindex.errors import PageIndexAPIError
+
+    class _SDKClient:
+        def submit_document(self, path: str, *, mode: str | None, wait: bool):
+            raise PageIndexAPIError(
+                "Failed to submit document: PDF has no content. All pages are blank."
+            )
+
+    with pytest.raises(RuntimeError, match="no text layer") as caught:
+        asyncio.run(PageIndexClient(_SDKClient()).submit_document("scan.pdf"))
+
+    assert "OCR" in str(caught.value)
+    assert "scanned" in str(caught.value)
+
+
+def test_submit_document_passes_other_sdk_errors_through() -> None:
+    from pageindex.errors import PageIndexAPIError
+
+    class _SDKClient:
+        def submit_document(self, path: str, *, mode: str | None, wait: bool):
+            raise PageIndexAPIError("Failed to submit document: quota exceeded")
+
+    with pytest.raises(PageIndexAPIError, match="quota exceeded"):
+        asyncio.run(PageIndexClient(_SDKClient()).submit_document("a.pdf"))
 
 
 def test_pageindex_ready_omits_embedding_identity(tmp_path, monkeypatch) -> None:

@@ -20,6 +20,8 @@ from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
     LIGHTRAG_PROVIDER,
+    PAGEINDEX_OSS_PROVIDER,
+    PAGEINDEX_PROVIDER,
     has_ready_provider_index,
     normalize_provider_name,
 )
@@ -217,14 +219,19 @@ class DocumentAdder:
                 f"Knowledge base '{kb_name}' uses legacy index format and requires reindex before incremental add"
             )
 
-        # Both pipelines create their first index on add; existing broken versions
-        # still require reindex instead of being silently replaced (#1458).
+        # Engines whose pipeline builds its first index from an incremental
+        # add may bootstrap on the first upload — an empty KB created through
+        # the no-files fast path must accept documents instead of erroring.
+        # Existing broken versions still require reindex instead of being
+        # silently replaced (#1458).
         versions = list_kb_versions(self.kb_dir)
         allows_bootstrap = (
             self.rag_provider
             in {
                 DEFAULT_PROVIDER,
                 LIGHTRAG_PROVIDER,
+                PAGEINDEX_PROVIDER,
+                PAGEINDEX_OSS_PROVIDER,
             }
             and not versions
         )

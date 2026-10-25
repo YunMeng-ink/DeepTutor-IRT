@@ -163,10 +163,23 @@ def test_document_adder_allows_empty_llamaindex_kb_to_bootstrap(tmp_path: Path) 
     assert adder.raw_dir.is_dir()
 
 
-@pytest.mark.parametrize("provider", ["graphrag", "pageindex", "pageindex-oss"])
-def test_empty_provider_kb_bootstraps_on_first_upload(
+@pytest.mark.parametrize("provider", ["pageindex", "pageindex-oss"])
+def test_document_adder_allows_empty_pageindex_kb_to_bootstrap(tmp_path: Path, provider) -> None:
+    """Create-then-upload must not look uninitialized for PageIndex KBs."""
+    (tmp_path / "page-kb").mkdir()
+
+    adder = DocumentAdder(kb_name="page-kb", base_dir=str(tmp_path), rag_provider=provider)
+
+    assert adder.rag_provider == provider
+    assert adder.raw_dir.is_dir()
+
+
+@pytest.mark.parametrize("provider", ["graphrag"])
+def test_empty_provider_kb_bootstraps_via_initialize(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
 ) -> None:
+    """GraphRAG cannot build its first index incrementally, so the wrapper
+    falls back to a full ``initialize`` instead of erroring."""
     from deeptutor.knowledge.manager import KnowledgeBaseManager
 
     kb_dir = tmp_path / "empty"
@@ -205,6 +218,45 @@ def test_empty_provider_kb_bootstraps_on_first_upload(
     assert asyncio.run(add_documents("empty", [str(doc)], base_dir=str(tmp_path))) == 1
     assert initialized == [("empty", [str(doc)])]
     assert KnowledgeBaseManager(base_dir=str(tmp_path)).get_info("empty")["status"] == "ready"
+
+
+@pytest.mark.parametrize("provider", ["pageindex", "pageindex-oss"])
+def test_empty_pageindex_kb_bootstraps_via_incremental_add(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """An empty PageIndex KB accepts its first upload through the ordinary
+    incremental-add path: per-file failures stay isolated instead of sinking
+    the whole batch."""
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
+
+    kb_dir = tmp_path / "empty"
+    (kb_dir / "raw").mkdir(parents=True)
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path))
+    manager.register_knowledge_base("empty")
+    manager.config["knowledge_bases"]["empty"]["rag_provider"] = provider
+    manager._save_config()
+    manager.update_kb_status(name="empty", status="ready")
+
+    doc = tmp_path / "lesson.pdf"
+    doc.write_text("Lesson", encoding="utf-8")
+    added: list[tuple[str, list[str]]] = []
+
+    class FakeRagService:
+        def __init__(self, *, kb_base_dir: str, provider: str | None = None) -> None:
+            assert kb_base_dir == str(tmp_path)
+
+        async def add_documents(self, kb_name: str, file_paths: list[str]) -> bool:
+            added.append((kb_name, file_paths))
+            return True
+
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", FakeRagService)
+
+    assert asyncio.run(add_documents("empty", [str(doc)], base_dir=str(tmp_path))) == 1
+    assert added == [("empty", [str(kb_dir / "raw" / "lesson.pdf")])]
+    entry = KnowledgeBaseManager(base_dir=str(tmp_path)).get_info("empty")
+    assert entry["status"] == "ready"
+    metadata = json.loads((kb_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["file_hashes"]
 
 
 def test_document_adder_unready_index_reports_probe_summary(tmp_path: Path) -> None:

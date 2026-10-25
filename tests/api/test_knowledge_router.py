@@ -1141,6 +1141,142 @@ def test_upload_task_bootstraps_empty_llamaindex_kb(monkeypatch, tmp_path: Path)
     assert metadata.get("file_hashes")
 
 
+def test_upload_task_bootstraps_empty_pageindex_oss_kb(monkeypatch, tmp_path: Path) -> None:
+    """First upload to an empty PageIndex OSS KB (created without files) must
+    build its initial index instead of failing with "not initialized"."""
+    base_dir = tmp_path / "knowledge_bases"
+    kb_dir = base_dir / "kb"
+    raw_dir = kb_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    (kb_dir / "metadata.json").write_text(
+        json.dumps({"rag_provider": "pageindex-oss", "needs_reindex": False}),
+        encoding="utf-8",
+    )
+    (base_dir / "kb_config.json").write_text(
+        json.dumps(
+            {
+                "knowledge_bases": {
+                    "kb": {
+                        "path": "kb",
+                        "rag_provider": "pageindex-oss",
+                        "status": "ready",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = raw_dir / "lesson.pdf"
+    source.write_text("hello", encoding="utf-8")
+
+    class _SuccessfulRagService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def add_documents(self, *_args, **_kwargs) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "deeptutor.knowledge.add_documents.RAGService",
+        _SuccessfulRagService,
+    )
+
+    asyncio.run(
+        knowledge_router_module.run_upload_processing_task(
+            kb_name="kb",
+            base_dir=str(base_dir),
+            uploaded_file_paths=[str(source)],
+            task_id="upload-empty-pageindex-bootstrap",
+            rag_provider="pageindex-oss",
+        )
+    )
+
+    persisted = json.loads((base_dir / "kb_config.json").read_text(encoding="utf-8"))
+    entry = persisted["knowledge_bases"]["kb"]
+    assert entry["status"] == "ready"
+    assert "last_error" not in entry
+    assert entry.get("last_indexed_count") == 1
+    assert entry.get("last_indexed_action") == "upload"
+    metadata = json.loads((kb_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata.get("file_hashes")
+
+
+def test_upload_task_bootstraps_empty_graphrag_kb_via_initialize(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """GraphRAG cannot bootstrap incrementally, so the upload task falls back
+    to a full initialize — the same fallback the CLI add path takes."""
+    base_dir = tmp_path / "knowledge_bases"
+    kb_dir = base_dir / "kb"
+    raw_dir = kb_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    (kb_dir / "metadata.json").write_text(
+        json.dumps({"rag_provider": "graphrag", "needs_reindex": False}),
+        encoding="utf-8",
+    )
+    (base_dir / "kb_config.json").write_text(
+        json.dumps(
+            {
+                "knowledge_bases": {
+                    "kb": {
+                        "path": "kb",
+                        "rag_provider": "graphrag",
+                        "status": "ready",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = raw_dir / "note.md"
+    source.write_text("hello", encoding="utf-8")
+    initialized: list[list[str]] = []
+
+    class _InitializingRagService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def initialize(
+            self,
+            *,
+            kb_name: str,
+            file_paths: list[str],
+            indexed_file_callback=None,
+        ) -> bool:
+            initialized.append(file_paths)
+            if indexed_file_callback is not None:
+                indexed_file_callback(file_paths)
+            return True
+
+        def _resolve_provider(self, _kb_name: str) -> str:
+            return "graphrag"
+
+    monkeypatch.setattr(
+        "deeptutor.knowledge.add_documents.RAGService",
+        _InitializingRagService,
+    )
+
+    asyncio.run(
+        knowledge_router_module.run_upload_processing_task(
+            kb_name="kb",
+            base_dir=str(base_dir),
+            uploaded_file_paths=[str(source)],
+            task_id="upload-empty-graphrag-bootstrap",
+            rag_provider="graphrag",
+        )
+    )
+
+    assert initialized == [[str(source)]]
+    persisted = json.loads((base_dir / "kb_config.json").read_text(encoding="utf-8"))
+    entry = persisted["knowledge_bases"]["kb"]
+    assert entry["status"] == "ready"
+    assert "last_error" not in entry
+    assert entry.get("last_indexed_count") == 1
+    assert entry.get("last_indexed_action") == "create"
+    metadata = json.loads((kb_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata.get("file_hashes")
+
+
 def test_upload_task_with_folder_root_preserves_subfolder_structure(
     monkeypatch, tmp_path: Path
 ) -> None:

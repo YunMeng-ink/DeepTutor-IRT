@@ -43,6 +43,7 @@ from deeptutor.api.utils.task_id_manager import TaskIDManager
 from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
 from deeptutor.knowledge.add_documents import (
     DocumentAdder,
+    _bootstrap_index_from_files,
     hashes_for_indexed_files,
     remove_raw_document,
 )
@@ -1208,13 +1209,56 @@ async def run_upload_processing_task(
                 total=len(uploaded_file_paths),
             )
 
-            adder = DocumentAdder(
-                kb_name=kb_name,
-                base_dir=base_dir,
-                progress_tracker=progress_tracker,
-                rag_provider=rag_provider,
-                accepted_indexing_snapshot=accepted_indexing_snapshot,
-            )
+            try:
+                adder = DocumentAdder(
+                    kb_name=kb_name,
+                    base_dir=base_dir,
+                    progress_tracker=progress_tracker,
+                    rag_provider=rag_provider,
+                    accepted_indexing_snapshot=accepted_indexing_snapshot,
+                )
+            except ValueError as exc:
+                if "not initialized" not in str(exc).lower():
+                    raise
+                # Empty KB (created through the no-files fast path) whose
+                # engine cannot build its first index incrementally: fall
+                # back to a full initialize from this batch — the same
+                # fallback the CLI add path takes.
+                bootstrap_manager = KnowledgeBaseManager(base_dir=base_dir)
+                indexed = await _bootstrap_index_from_files(
+                    kb_name=kb_name,
+                    source_files=uploaded_file_paths,
+                    base_dir=base_dir,
+                    manager=bootstrap_manager,
+                )
+                _task_log(task_id, f"Bootstrapped empty knowledge base with {indexed} file(s)")
+                if folder_id:
+                    try:
+                        bootstrap_manager.update_folder_sync_state(
+                            kb_name, folder_id, uploaded_file_paths, source_mtimes
+                        )
+                        _task_log(task_id, f"Updated folder sync state: {folder_id}")
+                    except Exception as sync_err:
+                        _task_log(
+                            task_id,
+                            f"Folder sync state update failed: {sync_err}",
+                            level="warning",
+                        )
+                progress_tracker.update(
+                    ProgressStage.COMPLETED,
+                    message_key="Successfully processed {{count}} files!",
+                    message_params={"count": indexed},
+                    current=indexed,
+                    total=max(indexed, 1),
+                    indexed_count=indexed,
+                    index_changed=indexed > 0,
+                    index_action="create",
+                )
+                task_manager.update_task_status(task_id, "completed")
+                task_stream_manager.emit_complete(
+                    task_id, f"Bootstrapped '{kb_name}' with {indexed} file(s)"
+                )
+                return
 
             # Staging blocks: a full-content hash per file, plus a copy for
             # anything not already under raw/. A BackgroundTasks entry declared

@@ -164,6 +164,8 @@ class PageIndexPipeline:
             )
             if count == 0:
                 self.logger.warning("PageIndex: no supported documents to add for '%s'", kb_name)
+                if existing is None:
+                    self._cleanup_failed_version_dir(storage_dir)
                 return False
             storage_dir.mkdir(parents=True, exist_ok=True)
             storage.write_manifest(storage_dir, manifest)
@@ -173,6 +175,11 @@ class PageIndexPipeline:
         except Exception as exc:
             self.logger.error("Failed to add documents to PageIndex KB: %s", exc)
             self.logger.error(traceback.format_exc())
+            if existing is None:
+                # A version dir created for this add must not linger as an
+                # incomplete version that blocks retries with "reindex
+                # required" — mirroring initialize()'s failure cleanup.
+                self._cleanup_failed_version_dir(storage_dir)
             raise
 
     async def _ingest(
