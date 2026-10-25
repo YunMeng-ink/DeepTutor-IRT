@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 import importlib.util
 import inspect
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -315,6 +316,63 @@ def build_llm_model_func(
     return llm_model_func
 
 
+_MM_ANALYSIS_FALLBACK_NAME = "figure"
+_MM_ANALYSIS_FALLBACK_DESCRIPTION = "no description available"
+
+
+def _image_type_fallback() -> str:
+    """LightRAG's own catch-all image type, or a neutral value pre-install."""
+    try:
+        from lightrag.prompt_multimodal import IMAGE_TYPE_FALLBACK
+
+        return str(IMAGE_TYPE_FALLBACK)
+    except Exception:
+        return _MM_ANALYSIS_FALLBACK_NAME
+
+
+def _repair_mm_analysis_json(text: str, *, with_type: bool) -> str:
+    """Backstop for LightRAG's hard-fail multimodal analysis contract.
+
+    The analyze stage requires every VLM response to carry non-empty
+    ``name``/``description`` (plus ``type`` for drawings) and fail-fasts the
+    whole document after a single retry — so one malformed response from a
+    weak vision model can cost an entire textbook (one scan in a 467-page
+    book failed twice and killed the document). This repairs only the
+    recoverable case: strict JSON that parses to an object but is missing
+    required fields gets neutral values the validator accepts. Unparseable
+    responses pass through untouched for LightRAG's own tolerant recovery.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(parsed, dict):
+        return text
+    fields = ["name", "description"] + (["type"] if with_type else [])
+    repaired = False
+    for field in fields:
+        value = parsed.get(field)
+        if isinstance(value, str) and value.strip():
+            continue
+        if field == "name":
+            parsed[field] = _MM_ANALYSIS_FALLBACK_NAME
+        elif field == "description":
+            parsed[field] = _MM_ANALYSIS_FALLBACK_DESCRIPTION
+        else:
+            parsed[field] = _image_type_fallback()
+        repaired = True
+    if not repaired:
+        return text
+    logger.warning(
+        "LightRAG analysis response was missing required fields %s; repaired with fallbacks",
+        fields,
+    )
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 def build_vision_model_func(
     *,
     io_bridge: OwnerLoopBridge | None = None,
@@ -372,7 +430,10 @@ def build_vision_model_func(
             with user_context(owner):
                 return await complete()
 
-        return await _run_adapter_with_retry(request, io_bridge=io_bridge)
+        result = await _run_adapter_with_retry(request, io_bridge=io_bridge)
+        if isinstance(result, str):
+            return _repair_mm_analysis_json(result, with_type=True)
+        return result
 
     return vision_model_func
 
