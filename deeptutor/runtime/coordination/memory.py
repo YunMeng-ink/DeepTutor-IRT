@@ -20,7 +20,11 @@ class MemoryCoordinator:
         self._turn_leases: dict[str, TurnLease] = {}
         self._session_turns: dict[str, str] = {}
         self._known_turns: set[str] = set()
-        self._events: dict[str, list[dict[str, Any]]] = {}
+        # seq -> payload per turn. A dict keyed by sequence keeps duplicate
+        # detection O(1); the linear scan it replaced was quadratic over a
+        # turn's token-granular events, inside the coordinator's global lock.
+        # Insertion order is ascending seq, which is what read_events relies on.
+        self._events: dict[str, dict[int, dict[str, Any]]] = {}
         self._commands: dict[str, list[tuple[str, TurnCommand]]] = {}
         self._command_ids: set[str] = set()
         self._background_commands: list[tuple[str, BackgroundCommand]] = []
@@ -113,30 +117,28 @@ class MemoryCoordinator:
 
     async def publish_event(self, turn_id: str, event: dict[str, Any]) -> dict[str, Any]:
         async with self._lock:
-            rows = self._events.setdefault(turn_id, [])
+            rows = self._events.setdefault(turn_id, {})
             payload = dict(event)
             seq = int(payload.get("seq") or 0)
             if seq <= 0:
-                seq = (int(rows[-1]["seq"]) if rows else 0) + 1
+                seq = next(reversed(rows), 0) + 1
             payload["turn_id"] = payload.get("turn_id") or turn_id
             payload["seq"] = seq
-            for existing in rows:
-                if int(existing["seq"]) != seq:
-                    continue
+            existing = rows.get(seq)
+            if existing is not None:
                 if existing != payload:
                     raise ValueError(f"Turn event conflict: {turn_id} seq={seq}")
                 return dict(existing)
-            if rows and seq <= int(rows[-1]["seq"]):
+            if rows and seq <= next(reversed(rows)):
                 raise ValueError(f"Turn event conflict: {turn_id} seq={seq}")
-            rows.append(payload)
+            rows[seq] = payload
             return dict(payload)
 
     async def read_events(self, turn_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        floor = max(0, int(after_seq))
         async with self._lock:
             return [
-                dict(event)
-                for event in self._events.get(turn_id, [])
-                if int(event["seq"]) > max(0, int(after_seq))
+                dict(event) for seq, event in self._events.get(turn_id, {}).items() if seq > floor
             ]
 
     async def submit_command(

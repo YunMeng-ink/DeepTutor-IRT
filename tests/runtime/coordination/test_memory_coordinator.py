@@ -151,3 +151,33 @@ async def test_acknowledged_turn_releases_payloads_but_live_owner_keeps_them() -
     assert await coordinator.read_commands("turn-a") == []
     assert "cancel-a" not in coordinator._command_ids
     assert await coordinator.list_expired_turn_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_detection_stays_exact_for_older_sequences() -> None:
+    """A retried publish must still dedupe against any earlier seq, and a
+    conflicting reuse must still raise — with O(1) lookup, not a scan."""
+    coordinator = MemoryCoordinator()
+    first = await coordinator.publish_event("turn-a", {"type": "content", "content": "a"})
+    for index in range(50):
+        await coordinator.publish_event("turn-a", {"type": "content", "content": f"chunk-{index}"})
+
+    assert await coordinator.publish_event("turn-a", dict(first)) == first
+    with pytest.raises(ValueError, match="conflict"):
+        await coordinator.publish_event(
+            "turn-a", {"seq": first["seq"], "type": "content", "content": "replacement"}
+        )
+    with pytest.raises(ValueError, match="conflict"):
+        await coordinator.publish_event("turn-a", {"seq": 10, "type": "content", "content": "x"})
+
+
+@pytest.mark.asyncio
+async def test_read_events_preserves_publish_order() -> None:
+    coordinator = MemoryCoordinator()
+    for index in range(20):
+        await coordinator.publish_event("turn-a", {"type": "content", "content": f"c{index}"})
+
+    events = await coordinator.read_events("turn-a")
+
+    assert [event["content"] for event in events] == [f"c{index}" for index in range(20)]
+    assert [event["seq"] for event in events] == list(range(1, 21))
