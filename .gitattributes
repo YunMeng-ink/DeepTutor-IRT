@@ -16,3 +16,16 @@ docker-compose.*.yml text eol=lf
 *.toml text eol=lf
 *.cfg text eol=lf
 *.ini text eol=lf
+
+# Binary fixtures: autocrlf must never touch their bytes. A hand-built ASCII
+# PDF is still a PDF — hash-verified fixtures break when git "normalizes" it.
+*.pdf -text
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.webp -text
+*.zip -text
+*.xlsx -text
+*.docx -text
+*.pptx -text
