@@ -21,7 +21,7 @@ from deeptutor.services.rag.index_versioning import (
 )
 from deeptutor.services.rag.kb_paths import resolve_kb_dir
 
-from . import block_policy, cache_reuse, engine, indexing_policy, ingress, storage
+from . import block_policy, cache_reuse, engine, indexing_policy, ingress, query_cache, storage
 from . import config as lr_config
 from .indexing_policy import (
     IndexingPolicyError,
@@ -33,6 +33,15 @@ from .worker import OwnerLoopBridge, run_in_worker_loop
 
 logger = logging.getLogger(__name__)
 DEFAULT_KB_BASE_DIR = str(get_runtime_data_root() / "knowledge_bases")
+
+
+def _version_stamp(root_dir: Path) -> tuple[int, int] | None:
+    """Cheap identity of a published version: its meta marker's file stamp."""
+    try:
+        stat = (Path(root_dir) / storage.META_FILENAME).stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 @dataclass(frozen=True)
@@ -295,6 +304,9 @@ class LightRagPipeline:
 
         async def job(io_bridge: OwnerLoopBridge) -> BatchOutcome:
             io_bridge.raise_if_cancelled()
+            # A cached query instance holds the storages of the same version
+            # directory open; indexing must not run beside it.
+            await query_cache.evict_root(working_dir)
             staged, preflight_failed = self._stage_documents(
                 working_dir,
                 file_paths,
@@ -631,22 +643,50 @@ class LightRagPipeline:
             embedding_config = deepcopy(get_embedding_config())
             storage.require_compatible_embedding(root_dir, embedding_config)
             query_roles = resolve_query_roles()
+            from .indexing_policy import cache_identity_for_config
+
+            # One cache entry per published version, owner loop, model binding
+            # and initiating user: the instance embeds the bridge back to the
+            # caller's loop and reports usage under the user that built it.
+            cache_key = query_cache.QueryCacheKey(
+                root=str(root_dir),
+                version_stamp=_version_stamp(root_dir),
+                owner_loop=id(asyncio.get_running_loop()),
+                identity=(
+                    tuple(
+                        sorted(
+                            (role, cache_identity_for_config(call.config))
+                            for role, call in query_roles.items()
+                        )
+                    ),
+                    tuple(sorted((role, call.owner.id) for role, call in query_roles.items())),
+                    (
+                        embedding_config.binding,
+                        embedding_config.model,
+                        embedding_config.dim,
+                    ),
+                ),
+            )
 
             async def job(io_bridge: OwnerLoopBridge) -> Any:
-                rag = engine.build_rag(
-                    root_dir,
-                    io_bridge=io_bridge,
-                    query_roles=query_roles,
-                    embedding_config=embedding_config,
-                )
-                failed = True
-                try:
+                async def build() -> Any:
+                    rag = engine.build_rag(
+                        root_dir,
+                        io_bridge=io_bridge,
+                        query_roles=query_roles,
+                        embedding_config=embedding_config,
+                    )
                     await engine.initialize(rag)
-                    result = await engine.query_with_sources(rag, query, mode)
-                    failed = False
-                    return result
-                finally:
-                    await engine.finalize(rag, cancel_pending=failed)
+                    return rag
+
+                rag = await query_cache.acquire(cache_key, build)
+                try:
+                    return await engine.query_with_sources(rag, query, mode)
+                except BaseException:
+                    # A failed query may leave the instance (or its queues) in
+                    # an unusable state; rebuild on the next attempt.
+                    await query_cache.discard(cache_key, rag)
+                    raise
 
             answer, sources = await run_in_worker_loop(job)
         except lr_config.LightRagNotAvailableError as exc:
