@@ -41,7 +41,9 @@ class KnowledgeBaseConfigService:
 
     def __init__(self, config_path: Path | None = None):
         self.config_path = config_path or DEFAULT_CONFIG_PATH
+        self._stamp: tuple[int, int] | None = None
         self._config = self._load_config()
+        self._stamp = self._file_stamp()
 
     @classmethod
     def get_instance(cls, config_path: Path | None = None) -> "KnowledgeBaseConfigService":
@@ -52,6 +54,13 @@ class KnowledgeBaseConfigService:
         if key not in cls._instances:
             cls._instances[key] = cls(resolved)
         return cls._instances[key]
+
+    def _file_stamp(self) -> tuple[int, int] | None:
+        try:
+            stat = self.config_path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
     def _load_config(self) -> dict[str, Any]:
         payload = _default_payload()
@@ -110,6 +119,7 @@ class KnowledgeBaseConfigService:
 
         self._config = self._normalize_payload(self._config)
         atomic_write_json(self.config_path, self._config)
+        self._stamp = self._file_stamp()
 
     def _refresh(self) -> None:
         """Re-read kb_config.json so this singleton sees changes made by
@@ -118,8 +128,15 @@ class KnowledgeBaseConfigService:
         Without this, every mutating call would rewrite the file from the
         in-memory snapshot taken at process start and undo any external
         cleanup. Read-modify-write keeps the two writers consistent.
+        The read is short-circuited on the file's (mtime_ns, size) stamp:
+        the polled config endpoints hit this on every request, and any
+        external write changes the stamp and forces a real reload.
         """
+        stamp = self._file_stamp()
+        if stamp is not None and stamp == self._stamp:
+            return
         self._config = self._load_config()
+        self._stamp = self._file_stamp()
 
     def _ensure_kb(self, kb_name: str) -> dict[str, Any]:
         knowledge_bases = self._config.setdefault("knowledge_bases", {})

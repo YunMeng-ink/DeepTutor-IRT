@@ -257,6 +257,10 @@ class ModelCatalogService:
     def __init__(self, path: Path | None = None):
         self.path = path or CATALOG_PATH
         self._lock = threading.RLock()
+        # GET /api/settings polls this catalog; memoize the normalized result
+        # against the file's (mtime_ns, size) stamp so polls stop re-reading.
+        self._cache_stamp: tuple[int, int] | None = None
+        self._cached_catalog: dict[str, Any] | None = None
 
     @classmethod
     def get_instance(cls, path: Path | None = None) -> "ModelCatalogService":
@@ -266,11 +270,25 @@ class ModelCatalogService:
             cls._instances[key] = cls(resolved)
         return cls._instances[key]
 
+    def _stat_stamp(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
     def load(self) -> dict[str, Any]:
         # Reads may migrate defaults. Serialize the complete read/migrate/write
         # with settings updates so an older snapshot cannot overwrite a save
         # or hold the destination open during this instance's replace (#1984).
         with self._lock:
+            stamp = self._stat_stamp()
+            if (
+                stamp is not None
+                and stamp == self._cache_stamp
+                and self._cached_catalog is not None
+            ):
+                return deepcopy(self._cached_catalog)
             loaded = self._read_existing_catalog()
             if loaded:
                 catalog = _default_catalog()
@@ -281,6 +299,9 @@ class ModelCatalogService:
                 self._normalize(catalog)
                 if merged_defaults or catalog != before:
                     self.save(catalog)
+                elif stamp is not None and self._stat_stamp() == stamp:
+                    self._cache_stamp = stamp
+                    self._cached_catalog = deepcopy(catalog)
                 return catalog
 
             catalog = _default_catalog()
@@ -317,6 +338,8 @@ class ModelCatalogService:
                 os.replace(temp_path, self.path)
             finally:
                 temp_path.unlink(missing_ok=True)
+            self._cache_stamp = self._stat_stamp()
+            self._cached_catalog = deepcopy(normalized)
             return normalized
 
     def update(self, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:

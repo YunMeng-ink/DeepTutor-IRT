@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 from deeptutor.services.file_io import atomic_write_json as _atomic_write_json
@@ -530,6 +531,11 @@ class RuntimeSettingsService:
         self._settings_derived_keys: frozenset[str] = frozenset(
             part.strip() for part in derived.split(",") if part.strip()
         )
+        # Loads are extremely hot (per request, per turn, per store lookup),
+        # so normalized payloads are memoized against the file's
+        # (mtime_ns, size) stamp; every write in this class refreshes it.
+        self._cache_lock = threading.Lock()
+        self._payload_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
     @classmethod
     def get_instance(
@@ -563,7 +569,7 @@ class RuntimeSettingsService:
 
     def save_system(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_system({**DEFAULT_SYSTEM_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("system"), payload)
+        self._write_json("system", payload)
         return payload
 
     def load_auth(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -578,7 +584,7 @@ class RuntimeSettingsService:
 
     def save_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_auth({**DEFAULT_AUTH_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("auth"), payload)
+        self._write_json("auth", payload)
         return payload
 
     def load_integrations(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -593,7 +599,7 @@ class RuntimeSettingsService:
 
     def save_integrations(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_integrations({**DEFAULT_INTEGRATIONS_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("integrations"), payload)
+        self._write_json("integrations", payload)
         return payload
 
     def load_document_parsing(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -623,7 +629,7 @@ class RuntimeSettingsService:
         payload = self._normalize_document_parsing(
             {**DEFAULT_DOCUMENT_PARSING_SETTINGS, **settings}
         )
-        _atomic_write_json(self.path_for(DOCUMENT_PARSING_SETTINGS_NAME), payload)
+        self._write_json(DOCUMENT_PARSING_SETTINGS_NAME, payload)
         return payload
 
     def load_mineru(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -648,7 +654,7 @@ class RuntimeSettingsService:
             {**_DEFAULT_MINERU_ENGINE, **settings}
         )
         payload = self._normalize_document_parsing({**full, "engines": engines})
-        _atomic_write_json(self.path_for(DOCUMENT_PARSING_SETTINGS_NAME), payload)
+        self._write_json(DOCUMENT_PARSING_SETTINGS_NAME, payload)
         return payload["engines"][DOCUMENT_PARSING_ENGINE_MINERU]
 
     def load_pageindex(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -663,7 +669,7 @@ class RuntimeSettingsService:
 
     def save_pageindex(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_pageindex({**DEFAULT_PAGEINDEX_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("pageindex"), payload)
+        self._write_json("pageindex", payload)
         return payload
 
     def load_query_rewrite(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -678,7 +684,7 @@ class RuntimeSettingsService:
 
     def save_query_rewrite(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_query_rewrite({**DEFAULT_QUERY_REWRITE_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("query_rewrite"), payload)
+        self._write_json("query_rewrite", payload)
         return payload
 
     def load_ima(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -689,7 +695,7 @@ class RuntimeSettingsService:
 
     def save_ima(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_ima({**DEFAULT_IMA_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("ima"), payload)
+        self._write_json("ima", payload)
         return payload
 
     def load_llamaindex(self, *, include_process_overrides: bool = True) -> dict[str, Any]:
@@ -704,7 +710,7 @@ class RuntimeSettingsService:
 
     def save_llamaindex(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_llamaindex({**DEFAULT_LLAMAINDEX_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("llamaindex"), payload)
+        self._write_json("llamaindex", payload)
         return payload
 
     def load_graphrag(self) -> dict[str, Any]:
@@ -712,11 +718,16 @@ class RuntimeSettingsService:
 
     def save_graphrag(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_graphrag({**DEFAULT_GRAPHRAG_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("graphrag"), payload)
+        self._write_json("graphrag", payload)
         return payload
 
     def load_lightrag(self) -> dict[str, Any]:
         path = self.path_for("lightrag")
+        stamp = self._stat_stamp(path)
+        if stamp is not None:
+            entry = self._cached_payload("lightrag")
+            if entry is not None and entry[0] == stamp:
+                return deepcopy(entry[1])
         if path.exists():
             # Invalid role settings must never become legacy chat-model fallback.
             with path.open(encoding="utf-8") as handle:
@@ -728,13 +739,15 @@ class RuntimeSettingsService:
                 {**DEFAULT_LIGHTRAG_SETTINGS, "version": 1, **loaded}
             )
             if normalized != loaded:
-                _atomic_write_json(path, normalized)
+                self._write_json("lightrag", normalized)
+            elif self._stat_stamp(path) == stamp:
+                self._store_cached_payload("lightrag", stamp, normalized)
             return normalized
         return self._load_or_create("lightrag", DEFAULT_LIGHTRAG_SETTINGS, self._normalize_lightrag)
 
     def save_lightrag(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_lightrag({**DEFAULT_LIGHTRAG_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("lightrag"), payload)
+        self._write_json("lightrag", payload)
         return payload
 
     def load_lightrag_server(self) -> dict[str, Any]:
@@ -746,7 +759,7 @@ class RuntimeSettingsService:
 
     def save_lightrag_server(self, settings: dict[str, Any]) -> dict[str, Any]:
         payload = self._normalize_lightrag_server({**DEFAULT_LIGHTRAG_SERVER_SETTINGS, **settings})
-        _atomic_write_json(self.path_for("lightrag_server"), payload)
+        self._write_json("lightrag_server", payload)
         return payload
 
     def ensure_defaults(self) -> None:
@@ -859,6 +872,34 @@ class RuntimeSettingsService:
             return ""
         return value
 
+    @staticmethod
+    def _stat_stamp(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _cached_payload(self, name: str) -> tuple[tuple[int, int], dict[str, Any]] | None:
+        with self._cache_lock:
+            return self._payload_cache.get(name)
+
+    def _store_cached_payload(
+        self,
+        name: str,
+        stamp: tuple[int, int],
+        payload: dict[str, Any],
+    ) -> None:
+        with self._cache_lock:
+            self._payload_cache[name] = (stamp, deepcopy(payload))
+
+    def _write_json(self, name: str, payload: dict[str, Any]) -> None:
+        """Persist ``payload`` and refresh the cache so the next load hits."""
+        _atomic_write_json(self.path_for(name), payload)
+        stamp = self._stat_stamp(self.path_for(name))
+        if stamp is not None:
+            self._store_cached_payload(name, stamp, payload)
+
     def _load_or_create(
         self,
         name: str,
@@ -866,15 +907,24 @@ class RuntimeSettingsService:
         normalizer: Callable[[dict[str, Any]], dict[str, Any]],
     ) -> dict[str, Any]:
         path = self.path_for(name)
+        stamp = self._stat_stamp(path)
+        if stamp is not None:
+            entry = self._cached_payload(name)
+            if entry is not None and entry[0] == stamp:
+                return deepcopy(entry[1])
         loaded = _json_object(path)
         if loaded:
             normalized = normalizer({**defaults, **loaded})
             if normalized != loaded:
-                _atomic_write_json(path, normalized)
+                self._write_json(name, normalized)
+            elif self._stat_stamp(path) == stamp:
+                # Only memoize when the file did not change while we read it,
+                # otherwise a write racing the read could poison the entry.
+                self._store_cached_payload(name, stamp, normalized)
             return normalized
 
         normalized = normalizer(_deepcopy_default(defaults))
-        _atomic_write_json(path, normalized)
+        self._write_json(name, normalized)
         return normalized
 
     def _migrate_legacy_document_parsing_file(self) -> None:
