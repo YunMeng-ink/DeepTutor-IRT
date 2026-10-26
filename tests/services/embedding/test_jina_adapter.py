@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from deeptutor.services.embedding.adapters.base import EmbeddingRequest
@@ -40,9 +41,7 @@ async def test_jina_adapter_maps_retrieval_roles_to_tasks(monkeypatch) -> None:
             captured["payload"] = json
             return _Response()
 
-    monkeypatch.setattr(
-        "deeptutor.services.embedding.adapters.jina.httpx.AsyncClient", _AsyncClient
-    )
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
     adapter = JinaEmbeddingAdapter(
         {
             "api_key": "test-key",

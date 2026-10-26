@@ -72,9 +72,11 @@ async def test_embedding_client_batches_requests(monkeypatch) -> None:
     vectors = await client.embed(["a", "b", "c"])
     assert len(vectors) == 3
     adapter = _FakeAdapter.instances[0]
+    # Batches may complete out of order now that independent requests overlap,
+    # so assert the batch shape rather than the call sequence.
     assert len(adapter.calls) == 2
-    assert len(adapter.calls[0].texts) == 2
-    assert len(adapter.calls[1].texts) == 1
+    assert sorted(len(call.texts) for call in adapter.calls) == [1, 2]
+    assert [text for call in adapter.calls for text in call.texts].__len__() == 3
     assert adapter.config["dimensions"] == 8
 
 
@@ -166,7 +168,9 @@ async def test_embedding_requests_are_spaced_but_http_can_overlap(monkeypatch, m
     monkeypatch.setattr(EmbeddingClient, "_spacing_lock", None)
     monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", 0.0)
     config = _build_config("openai")
-    config.batch_delay = 0.02
+    # 0.1s keeps the assertion several clock ticks clear of the coarsest
+    # supported monotonic() resolution (15.6 ms on Windows GetTickCount64).
+    config.batch_delay = 0.1
     first_client = EmbeddingClient(config)
     second_client = EmbeddingClient(config)
     first = asyncio.create_task(first_client.embed(["text"]))
@@ -178,7 +182,7 @@ async def test_embedding_requests_are_spaced_but_http_can_overlap(monkeypatch, m
     try:
         # Both requests must start before either HTTP response is released.
         await asyncio.wait_for(entered.wait(), timeout=1)
-        assert starts[1] - starts[0] >= config.batch_delay
+        assert starts[1] - starts[0] >= config.batch_delay - 0.02
     finally:
         release.set()
         await asyncio.gather(first, second)
@@ -522,9 +526,9 @@ def test_embedding_spacing_shared_across_thread_event_loops(monkeypatch):
     monkeypatch.setattr(EmbeddingClient, "_spacing_lock", None)
     monkeypatch.setattr(EmbeddingClient, "_last_request_monotonic", 0.0)
     config = _build_config("openai")
-    config.batch_delay = 0.02
+    config.batch_delay = 0.1
     clients = [EmbeddingClient(config), EmbeddingClient(config)]
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(asyncio.run, client.embed(["text"])) for client in clients]
         assert all(len(future.result(timeout=3)) == 1 for future in futures)
-    assert starts[1] - starts[0] >= config.batch_delay
+    assert starts[1] - starts[0] >= config.batch_delay - 0.02

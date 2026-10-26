@@ -28,6 +28,10 @@ class EmbeddingConfig:
     request_timeout: int = 60
     batch_size: int = 10
     batch_delay: float = 0.0
+    # Independent HTTP batch requests kept in flight. ``batch_delay`` is the
+    # provider's throttle signal: when a delay is configured the client stays
+    # serial so the configured spacing is actually respected.
+    max_concurrent_batches: int = 4
 
 
 _scoped_config: ContextVar[EmbeddingConfig | None] = ContextVar("embedding_config", default=None)
@@ -111,4 +115,5 @@ def get_embedding_config(
         request_timeout=max(1, resolved.request_timeout),
         batch_size=max(1, resolved.batch_size),
         batch_delay=max(0.0, resolved.batch_delay),
+        max_concurrent_batches=max(1, int(getattr(resolved, "max_concurrent_batches", 4))),
     )

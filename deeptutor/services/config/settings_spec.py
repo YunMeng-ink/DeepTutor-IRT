@@ -601,6 +601,7 @@ async def _probe_embedding(value: str) -> ProbeResult:
                 request_timeout=max(1, min(resolved.request_timeout, int(_PROBE_TIMEOUT_SECONDS))),
                 batch_size=max(1, resolved.batch_size),
                 batch_delay=max(0.0, resolved.batch_delay),
+                max_concurrent_batches=max(1, int(resolved.max_concurrent_batches)),
             )
         )
         vectors = await asyncio.wait_for(client.embed(["ping"]), timeout=_PROBE_TIMEOUT_SECONDS)

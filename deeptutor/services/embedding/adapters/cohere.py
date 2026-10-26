@@ -3,8 +3,6 @@
 import logging
 from typing import Any, Dict
 
-import httpx
-
 from deeptutor.services.llm.openai_http_client import disable_ssl_verify_enabled
 
 from .base import BaseEmbeddingAdapter, EmbeddingRequest, EmbeddingResponse
@@ -127,16 +125,16 @@ class CohereEmbeddingAdapter(BaseEmbeddingAdapter):
 
         logger.debug(f"Sending embedding request to {url} with {len(request.texts)} texts")
 
-        async with httpx.AsyncClient(
+        client = self._persistent_client(
             timeout=self.request_timeout, verify=not disable_ssl_verify_enabled()
-        ) as client:
-            response = await client.post(url, json=payload, headers=headers)
+        )
+        response = await client.post(url, json=payload, headers=headers)
 
-            if response.status_code >= 400:
-                logger.error(f"HTTP {response.status_code} response body: {response.text}")
+        if response.status_code >= 400:
+            logger.error(f"HTTP {response.status_code} response body: {response.text}")
 
-            response.raise_for_status()
-            data = response.json()
+        response.raise_for_status()
+        data = response.json()
 
         if api_version == "v1":
             embeddings = data["embeddings"]

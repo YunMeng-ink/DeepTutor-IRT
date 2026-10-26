@@ -638,6 +638,7 @@ class ResolvedEmbeddingConfig:
     request_timeout: int = 60
     batch_size: int = 10
     batch_delay: float = 0.0
+    max_concurrent_batches: int = 4
 
 
 @dataclass(slots=True)
@@ -1218,6 +1219,7 @@ def resolve_embedding_runtime_config(
         # allow per-profile batch_size/batch_delay in the embedding profile, defaults unchanged
         batch_size=_clamp_batch_size(profile),
         batch_delay=_clamp_batch_delay(profile),
+        max_concurrent_batches=_clamp_max_concurrent_batches(profile),
     )
 
 
@@ -1640,3 +1642,10 @@ def _clamp_batch_delay(profile: dict | None) -> float:
         return max(0.0, float((profile or {}).get("batch_delay", 0.0)))
     except Exception:
         return 0.0
+
+
+def _clamp_max_concurrent_batches(profile: dict | None) -> int:
+    try:
+        return max(1, min(16, int((profile or {}).get("max_concurrent_batches", 4))))
+    except Exception:
+        return 4

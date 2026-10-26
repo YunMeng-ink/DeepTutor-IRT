@@ -374,6 +374,7 @@ class ConfigTestRunner:
             request_timeout=max(1, resolved.request_timeout),
             batch_size=max(1, resolved.batch_size),
             batch_delay=max(0.0, resolved.batch_delay),
+            max_concurrent_batches=max(1, int(resolved.max_concurrent_batches)),
         )
         run.emit(
             "info", f"Resolved embedding model `{config.model}` with binding `{config.binding}`."

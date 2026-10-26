@@ -7,8 +7,13 @@ Defines the contract that all embedding providers must implement.
 """
 
 from abc import ABC, abstractmethod
+import asyncio
 from dataclasses import dataclass
+import threading
 from typing import Any, Dict, List, Optional
+import weakref
+
+import httpx
 
 from deeptutor.services.keypool import KeyPool
 
@@ -168,6 +173,52 @@ class BaseEmbeddingAdapter(ABC):
         self.send_dimensions: Optional[bool] = config.get("send_dimensions")
         self.request_timeout = config.get("request_timeout", 60)
         self.extra_headers = config.get("extra_headers") or {}
+        # One keep-alive client per event loop. Indexing issues dozens of
+        # batch requests for a single document; building a client per batch
+        # paid a TCP+TLS handshake for each one. httpx clients are bound to
+        # the loop that created them, so the cache is keyed by loop identity
+        # and entries whose loop is gone are dropped.
+        self._clients: dict[int, tuple[weakref.ref, httpx.AsyncClient]] = {}
+        self._clients_lock = threading.Lock()
+
+    def _persistent_client(
+        self,
+        *,
+        timeout: httpx.Timeout | float,
+        verify: bool = True,
+    ) -> httpx.AsyncClient:
+        """Return a reusable AsyncClient for the running event loop."""
+        loop = asyncio.get_running_loop()
+        key = id(loop)
+        with self._clients_lock:
+            entry = self._clients.get(key)
+            if entry is not None:
+                loop_ref, client = entry
+                if loop_ref() is loop:
+                    return client
+                self._clients.pop(key, None)
+            self._prune_dead_clients_locked()
+            client = httpx.AsyncClient(timeout=timeout, verify=verify)
+            self._clients[key] = (weakref.ref(loop), client)
+            return client
+
+    def _prune_dead_clients_locked(self) -> None:
+        for key, (loop_ref, _client) in list(self._clients.items()):
+            loop = loop_ref()
+            if loop is None or loop.is_closed():
+                self._clients.pop(key, None)
+
+    async def aclose_clients(self) -> None:
+        """Close every cached client (called on config swap/shutdown)."""
+        with self._clients_lock:
+            clients = [client for _, client in self._clients.values()]
+            self._clients.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except RuntimeError:
+                # The owning loop already closed; the sockets die with it.
+                pass
 
     @abstractmethod
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:

@@ -60,37 +60,37 @@ class OllamaEmbeddingAdapter(BaseEmbeddingAdapter):
         logger.debug(f"Sending embedding request to {url} with {len(request.texts)} texts")
 
         try:
-            async with httpx.AsyncClient(
+            client = self._persistent_client(
                 timeout=self.request_timeout, verify=not disable_ssl_verify_enabled()
-            ) as client:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers={str(k): str(v) for k, v in self.extra_headers.items()},
+            )
+            response = await client.post(
+                url,
+                json=payload,
+                headers={str(k): str(v) for k, v in self.extra_headers.items()},
+            )
+
+            if response.status_code == 404:
+                try:
+                    health_check = await client.get(self._tags_url())
+                    if health_check.status_code == 200:
+                        available_models = [
+                            m.get("name", "") for m in health_check.json().get("models", [])
+                        ]
+                        raise ValueError(
+                            f"Model '{payload['model']}' not found in Ollama. "
+                            f"Available models: {', '.join(available_models[:10])}. "
+                            f"Download it with: ollama pull {payload['model']}"
+                        )
+                except httpx.HTTPError:
+                    pass
+
+                raise ValueError(
+                    f"Model '{payload['model']}' not found. "
+                    f"Download it with: ollama pull {payload['model']}"
                 )
 
-                if response.status_code == 404:
-                    try:
-                        health_check = await client.get(self._tags_url())
-                        if health_check.status_code == 200:
-                            available_models = [
-                                m.get("name", "") for m in health_check.json().get("models", [])
-                            ]
-                            raise ValueError(
-                                f"Model '{payload['model']}' not found in Ollama. "
-                                f"Available models: {', '.join(available_models[:10])}. "
-                                f"Download it with: ollama pull {payload['model']}"
-                            )
-                    except httpx.HTTPError:
-                        pass
-
-                    raise ValueError(
-                        f"Model '{payload['model']}' not found. "
-                        f"Download it with: ollama pull {payload['model']}"
-                    )
-
-                response.raise_for_status()
-                data = response.json()
+            response.raise_for_status()
+            data = response.json()
 
         except httpx.ConnectError as e:
             raise ConnectionError(

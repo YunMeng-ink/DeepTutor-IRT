@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 import threading
@@ -147,8 +148,12 @@ class EmbeddingClient:
         expected_dim: int | None = None
 
         total_batches = (len(texts) + batch_size - 1) // batch_size
-        for i, start in enumerate(range(0, len(texts), batch_size)):
-            batch = texts[start : start + batch_size]
+        batches = [
+            (index, start, texts[start : start + batch_size])
+            for index, start in enumerate(range(0, len(texts), batch_size))
+        ]
+
+        async def run_batch(index: int, start: int, batch: List[str]) -> List[List[float]]:
             request = EmbeddingRequest(
                 texts=batch,
                 model=self.config.model,
@@ -168,22 +173,81 @@ class EmbeddingClient:
                 self.logger.error(
                     f"Embedding batch failed "
                     f"(binding={self.config.binding}, model={self.config.model}, "
-                    f"batch_index={i + 1}/{total_batches}, batch_items={len(batch)}, "
+                    f"batch_index={index + 1}/{total_batches}, batch_items={len(batch)}, "
                     f"first_chunk_chars={first_chunk_chars}, "
                     f"longest_chunk_chars={longest_chunk_chars}): {exc}\n"
                     f"{traceback.format_exc()}"
                 )
                 raise
-            validated = validate_embedding_batch(
+            return validate_embedding_batch(
                 response.embeddings,
                 expected_count=len(batch),
                 binding=self.config.binding,
                 model=self.config.model,
-                batch_index=i + 1,
+                batch_index=index + 1,
                 total_batches=total_batches,
                 start_index=start,
             )
-            batch_dim = len(validated[0]) if validated else 0
+
+        # Progress must stay monotone even though batches finish out of order,
+        # otherwise the task stream shows the bar jumping backwards.
+        completed = 0
+
+        async def report_progress() -> None:
+            nonlocal completed
+            completed += 1
+            if not progress_callback:
+                return
+            try:
+                progress_callback(completed, total_batches)
+            except Exception as exc:
+                # Progress feedback is best-effort: never fail the embedding
+                # run, but never lose the failure silently either — index
+                # progress would read as stalled with no trace why.
+                self.logger.warning(
+                    f"Embedding progress callback failed "
+                    f"(batch {completed}/{total_batches}): {exc}",
+                    exc_info=True,
+                )
+
+        async def run_batch_with_progress(
+            index: int, start: int, batch: List[str]
+        ) -> tuple[int, List[List[float]]]:
+            validated = await run_batch(index, start, batch)
+            await report_progress()
+            return (len(validated[0]) if validated else 0), validated
+
+        concurrency = self._batch_concurrency(total_batches)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def run_guarded(
+            index: int, start: int, batch: List[str]
+        ) -> tuple[int, List[List[float]]]:
+            async with semaphore:
+                return await run_batch_with_progress(index, start, batch)
+
+        outcomes: list[tuple[int, List[List[float]]]]
+        if concurrency <= 1:
+            outcomes = [
+                await run_batch_with_progress(index, start, batch)
+                for index, start, batch in batches
+            ]
+        else:
+            tasks = [
+                asyncio.create_task(run_guarded(index, start, batch))
+                for index, start, batch in batches
+            ]
+            try:
+                # gather keeps batch order, so vectors land at their original
+                # offsets no matter which request finished first.
+                outcomes = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+        for index, (batch_dim, validated) in enumerate(outcomes):
             if expected_dim is None:
                 expected_dim = batch_dim
             elif batch_dim != expected_dim:
@@ -191,31 +255,27 @@ class EmbeddingClient:
                     "Embedding provider returned inconsistent vector dimensions "
                     f"across batches (binding={self.config.binding}, "
                     f"model={self.config.model}): expected {expected_dim}, "
-                    f"got {batch_dim} in batch {i + 1}/{total_batches}. "
+                    f"got {batch_dim} in batch {index + 1}/{total_batches}. "
                     "Use a single embedding model/dimension and re-index the knowledge base."
                 )
-
             all_embeddings.extend(validated)
-
-            # Report progress after each batch
-            if progress_callback:
-                try:
-                    progress_callback(i + 1, total_batches)
-                except Exception as exc:
-                    # Progress feedback is best-effort: never fail the embedding
-                    # run, but never lose the failure silently either — index
-                    # progress would read as stalled with no trace why.
-                    self.logger.warning(
-                        f"Embedding progress callback failed "
-                        f"(batch {i + 1}/{total_batches}): {exc}",
-                        exc_info=True,
-                    )
 
         self.logger.debug(
             f"Generated {len(all_embeddings)} embeddings using "
-            f"{self.config.binding} (batch_size={batch_size})"
+            f"{self.config.binding} (batch_size={batch_size}, "
+            f"concurrency={concurrency})"
         )
         return all_embeddings
+
+    def _batch_concurrency(self, total_batches: int) -> int:
+        """How many batch requests to keep in flight for this run.
+
+        ``batch_delay`` is the provider throttle: a configured delay means the
+        caller wants serial spacing, so concurrency collapses to one.
+        """
+        if total_batches <= 1 or self.config.batch_delay > 0:
+            return 1
+        return max(1, min(int(self.config.max_concurrent_batches), total_batches))
 
     def supports_multimodal_contents(self) -> bool:
         """Return whether the configured adapter/model accepts multimodal contents."""

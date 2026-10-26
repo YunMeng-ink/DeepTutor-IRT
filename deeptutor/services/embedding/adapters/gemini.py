@@ -300,13 +300,10 @@ class GeminiEmbeddingAdapter(OpenAICompatibleEmbeddingAdapter):
 
         data: Any = None
         last_error: Exception | None = None
+        client = self._persistent_client(timeout=timeout, verify=not disable_ssl_verify_enabled())
         for attempt in range(1 + self._MAX_RETRIES):
             try:
-                async with httpx.AsyncClient(
-                    timeout=timeout,
-                    verify=not disable_ssl_verify_enabled(),
-                ) as client:
-                    response = await client.post(url, json=payload, headers=headers)
+                response = await client.post(url, json=payload, headers=headers)
                 if response.status_code == 429:
                     try:
                         retry_after = float(response.headers.get("Retry-After", 0))

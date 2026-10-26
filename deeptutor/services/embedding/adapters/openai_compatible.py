@@ -227,6 +227,7 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
             write=10.0,
             pool=10.0,
         )
+        client = self._persistent_client(timeout=timeout, verify=not disable_ssl_verify_enabled())
         last_exc: Exception | None = None
         rate_limit_retries = 0
         # 槽位必须 > 限流重试上限：429 的 continue 也消耗 attempt，若循环
@@ -234,102 +235,96 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
         # （UnboundLocalError）。多给 4 个槽位兜住 8 轮限流 + 网络重试。
         for attempt in range(1 + max(self._MAX_RETRIES, 10)):
             try:
-                async with httpx.AsyncClient(
-                    timeout=timeout, verify=not disable_ssl_verify_enabled()
-                ) as client:
-                    response = await client.post(url, json=payload, headers=headers)
+                response = await client.post(url, json=payload, headers=headers)
 
-                    # Handle rate limiting (429) with retry
-                    if response.status_code == 429:
-                        if self._key_pool:
-                            self._key_pool.mark_429(api_key)
-                        # 滑动窗口 429 是瞬态的：长跑（全库 reindex 数小时）里
-                        # 单次 429 不该报废整跑。最多 8 轮，每轮等窗口滑过
-                        # （Retry-After 优先，无头保守 60s）。月度额度耗尽的
-                        # 429 会连挂 8 轮后仍然 raise，不会无限空转。
-                        if rate_limit_retries < 8:
-                            rate_limit_retries += 1
-                            retry_after = parse_retry_after_seconds(
-                                response.headers.get("Retry-After")
-                            )
-                            await asyncio.sleep(max(retry_after or 0.0, 60))
-                            try:
-                                api_key = self._auth_api_key()
-                            except RuntimeError:
-                                # 池内 key 全在冷却（KeyPool 冷却 60s）。
-                                # 等冷却期过后再取一次；仍取不到才认输。
-                                await asyncio.sleep(65)
-                                api_key = self._auth_api_key()
-                            self._set_auth_header(headers, api_key)
-                            continue
+                # Handle rate limiting (429) with retry
+                if response.status_code == 429:
+                    if self._key_pool:
+                        self._key_pool.mark_429(api_key)
+                    # 滑动窗口 429 是瞬态的：长跑（全库 reindex 数小时）里
+                    # 单次 429 不该报废整跑。最多 8 轮，每轮等窗口滑过
+                    # （Retry-After 优先，无头保守 60s）。月度额度耗尽的
+                    # 429 会连挂 8 轮后仍然 raise，不会无限空转。
+                    if rate_limit_retries < 8:
+                        rate_limit_retries += 1
                         retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
-                        raise EmbeddingProviderError(
-                            "Embedding provider remained rate limited after key rotation"
-                            + (f" (Retry-After: {retry_after:g}s)" if retry_after else ""),
-                            status=429,
-                            model=model,
-                            url=url,
-                            provider="openai_compat",
-                        )
+                        await asyncio.sleep(max(retry_after or 0.0, 60))
+                        try:
+                            api_key = self._auth_api_key()
+                        except RuntimeError:
+                            # 池内 key 全在冷却（KeyPool 冷却 60s）。
+                            # 等冷却期过后再取一次；仍取不到才认输。
+                            await asyncio.sleep(65)
+                            api_key = self._auth_api_key()
+                        self._set_auth_header(headers, api_key)
+                        continue
+                    retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
+                    raise EmbeddingProviderError(
+                        "Embedding provider remained rate limited after key rotation"
+                        + (f" (Retry-After: {retry_after:g}s)" if retry_after else ""),
+                        status=429,
+                        model=model,
+                        url=url,
+                        provider="openai_compat",
+                    )
 
-                    if response.status_code >= 400:
-                        body_text = response.text
-                        if "encoding_format" not in payload and rejects_absent_encoding_format(
-                            response.status_code, body_text
-                        ):
-                            payload["encoding_format"] = "float"
-                            logger.info(
-                                "Gateway requires an explicit `encoding_format`; "
-                                "retrying once with 'float' (%s)",
-                                url,
-                            )
-                            continue
-                        logger.error(f"HTTP {response.status_code} from {url}: {body_text[:2000]}")
-                        raise EmbeddingProviderError(
-                            f"Embedding provider returned HTTP {response.status_code}",
-                            status=response.status_code,
-                            body=body_text,
-                            model=model,
-                            url=url,
-                            provider="openai_compat",
+                if response.status_code >= 400:
+                    body_text = response.text
+                    if "encoding_format" not in payload and rejects_absent_encoding_format(
+                        response.status_code, body_text
+                    ):
+                        payload["encoding_format"] = "float"
+                        logger.info(
+                            "Gateway requires an explicit `encoding_format`; "
+                            "retrying once with 'float' (%s)",
+                            url,
                         )
+                        continue
+                    logger.error(f"HTTP {response.status_code} from {url}: {body_text[:2000]}")
+                    raise EmbeddingProviderError(
+                        f"Embedding provider returned HTTP {response.status_code}",
+                        status=response.status_code,
+                        body=body_text,
+                        model=model,
+                        url=url,
+                        provider="openai_compat",
+                    )
 
-                    # A 2xx response with non-JSON body usually means the
-                    # endpoint/model pairing is wrong or a gateway routed us to
-                    # an HTML page. Surface that as structured diagnostics.
-                    try:
-                        data = response.json()
-                    except (json.JSONDecodeError, ValueError) as exc:
-                        body_text = response.text
-                        content_type = response.headers.get("content-type", "")
-                        body_preview = body_text.strip()[:200] or "<empty body>"
-                        hint = ""
-                        if not body_text.strip():
-                            hint = (
-                                " The response body was empty — the endpoint may "
-                                "not support embeddings or the selected model "
-                                "may not be an embedding model."
-                            )
-                        elif (
-                            "text/html" in content_type.lower()
-                            or body_preview.lstrip().startswith("<")
-                        ):
-                            hint = (
-                                " The response was HTML, not JSON — the URL is "
-                                "likely wrong or the gateway does not expose "
-                                "`/v1/embeddings`."
-                            )
-                        raise EmbeddingProviderError(
-                            (
-                                f"Embedding provider returned non-JSON response "
-                                f"(content-type={content_type!r}): {exc}.{hint}"
-                            ),
-                            status=response.status_code,
-                            body=body_text,
-                            model=model,
-                            url=url,
-                            provider="openai_compat",
-                        ) from exc
+                # A 2xx response with non-JSON body usually means the
+                # endpoint/model pairing is wrong or a gateway routed us to
+                # an HTML page. Surface that as structured diagnostics.
+                try:
+                    data = response.json()
+                except (json.JSONDecodeError, ValueError) as exc:
+                    body_text = response.text
+                    content_type = response.headers.get("content-type", "")
+                    body_preview = body_text.strip()[:200] or "<empty body>"
+                    hint = ""
+                    if not body_text.strip():
+                        hint = (
+                            " The response body was empty — the endpoint may "
+                            "not support embeddings or the selected model "
+                            "may not be an embedding model."
+                        )
+                    elif "text/html" in content_type.lower() or body_preview.lstrip().startswith(
+                        "<"
+                    ):
+                        hint = (
+                            " The response was HTML, not JSON — the URL is "
+                            "likely wrong or the gateway does not expose "
+                            "`/v1/embeddings`."
+                        )
+                    raise EmbeddingProviderError(
+                        (
+                            f"Embedding provider returned non-JSON response "
+                            f"(content-type={content_type!r}): {exc}.{hint}"
+                        ),
+                        status=response.status_code,
+                        body=body_text,
+                        model=model,
+                        url=url,
+                        provider="openai_compat",
+                    ) from exc
                 break
             except httpx.TransportError as exc:
                 # httpx.TransportError covers all transient transport-layer
