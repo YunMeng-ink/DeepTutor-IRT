@@ -44,6 +44,20 @@ def _version_stamp(root_dir: Path) -> tuple[int, int] | None:
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def _embedding_cache_identity(config: Any) -> tuple[Any, Any, Any]:
+    """Distinguish cache entries by embedding binding/model/dimension.
+
+    Read defensively: callers (and tests) may pass a stand-in object rather
+    than a resolved EmbeddingConfig, and a missing attribute must not break
+    a query.
+    """
+    return (
+        getattr(config, "binding", None),
+        getattr(config, "model", None),
+        getattr(config, "dim", None),
+    )
+
+
 @dataclass(frozen=True)
 class BatchOutcome:
     requested: int
@@ -660,11 +674,7 @@ class LightRagPipeline:
                         )
                     ),
                     tuple(sorted((role, call.owner.id) for role, call in query_roles.items())),
-                    (
-                        embedding_config.binding,
-                        embedding_config.model,
-                        embedding_config.dim,
-                    ),
+                    _embedding_cache_identity(embedding_config),
                 ),
             )
 
