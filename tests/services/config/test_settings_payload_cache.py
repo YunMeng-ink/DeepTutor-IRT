@@ -146,3 +146,21 @@ class TestKnowledgeBaseConfigCache:
         _bump_mtime(path)
 
         assert service.get_default_kb() == "externally-set"
+
+
+class TestKnowledgeBaseConfigIsolation:
+    def test_get_all_configs_returns_a_copy(self, tmp_path: Path) -> None:
+        """A read-only consumer must not be able to poison the cache."""
+        path = tmp_path / "kb_config.json"
+        path.write_text(
+            json.dumps({"defaults": {"default_kb": "a"}, "knowledge_bases": {}}),
+            encoding="utf-8",
+        )
+        service = KnowledgeBaseConfigService(path)
+
+        snapshot = service.get_all_configs()
+        snapshot["defaults"]["default_kb"] = "mutated"
+        snapshot["knowledge_bases"]["injected"] = {"path": "injected"}
+
+        assert service.get_default_kb() == "a"
+        assert service.get_all_configs()["knowledge_bases"] == {}

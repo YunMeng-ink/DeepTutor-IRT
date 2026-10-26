@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 from pathlib import Path
@@ -201,7 +202,10 @@ class KnowledgeBaseConfigService:
 
     def get_all_configs(self) -> dict[str, Any]:
         self._refresh()
-        return self._config
+        # Callers may mutate entries in place (the embedding-usage endpoint
+        # runs migrate_binding over them). Return a copy so the memoized
+        # payload cannot be poisoned by a read-only consumer.
+        return deepcopy(self._config)
 
     def set_global_defaults(self, defaults: dict[str, Any]) -> None:
         self._refresh()
