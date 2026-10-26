@@ -370,6 +370,98 @@ class DocumentAdder:
             return await self._process_lightrag_batch(new_files)
 
         rag_service = RAGService(kb_base_dir=str(self.base_dir), provider=self.rag_provider)
+
+        # The default engine accepts a file list and rewrites the index once;
+        # indexing the files one by one reloaded, re-validated, re-persisted
+        # and re-verified the whole index (and rebuilt BM25) per file. Batch
+        # first, and fall back to per-file isolation only if the batch fails,
+        # so one bad file still cannot take the others down.
+        if self.rag_provider == DEFAULT_PROVIDER and len(new_files) > 1:
+            batched = await self._process_batched(new_files, rag_service)
+            if batched is not None:
+                return batched
+
+        return await self._process_files_individually(new_files, rag_service)
+
+    async def _process_batched(
+        self,
+        files: List[Path],
+        rag_service: RAGService,
+    ) -> DocumentIndexResult | None:
+        """Index every file in one provider call; ``None`` means fall back."""
+        from deeptutor.knowledge.progress_tracker import ProgressStage
+
+        total_files = len(files)
+        if self.progress_tracker is not None:
+            self.progress_tracker.update(
+                ProgressStage.PROCESSING_FILE,
+                message=f"Indexing {total_files} files",
+                current=0,
+                total=total_files,
+            )
+        try:
+            success = await rag_service.add_documents(
+                self.kb_name, [str(doc_file) for doc_file in files]
+            )
+        except PermissionError as e:
+            logger.exception("Permission denied while indexing a batch: %s", e)
+            raise DataVolumePermissionError(
+                format_data_volume_permission_error(self.kb_dir, cause=e)
+            ) from e
+        except Exception as exc:
+            logger.warning(
+                "Batched indexing of %d files failed; retrying one file at a time: %s",
+                total_files,
+                exc,
+                exc_info=True,
+            )
+            return None
+        if not success:
+            logger.warning(
+                "Batched indexing of %d files was rejected; retrying one file at a time",
+                total_files,
+            )
+            return None
+
+        processed_files: list[Path] = []
+        for doc_file in files:
+            await self._record_hash_after_index(doc_file)
+            logger.info(f"Processed: {doc_file.name}")
+            processed_files.append(doc_file)
+            if self.progress_tracker is not None:
+                self.progress_tracker.update(
+                    ProgressStage.PROCESSING_FILE,
+                    message_key="Indexed {{name}}",
+                    message_params={"name": doc_file.name},
+                    current=len(processed_files),
+                    total=total_files,
+                )
+        return DocumentIndexResult(processed_files=processed_files, failures=[])
+
+    async def _record_hash_after_index(self, doc_file: Path) -> None:
+        """Record the duplicate-detection hash after a successful index.
+
+        Re-hashing reads the whole file, so it stays off the event loop: this
+        runs inside a FastAPI BackgroundTasks entry, which is awaited on the
+        loop and would otherwise stall unrelated requests once per file (#777).
+        """
+        try:
+            await asyncio.to_thread(self._record_successful_hash, doc_file)
+        except Exception:
+            if self.rag_provider != LIGHTRAG_PROVIDER:
+                raise
+            logger.warning(
+                "LightRAG published '%s' before its duplicate-detection hash was recorded",
+                doc_file.name,
+                exc_info=True,
+            )
+
+    async def _process_files_individually(
+        self,
+        new_files: List[Path],
+        rag_service: RAGService,
+    ) -> DocumentIndexResult:
+        """Per-file isolation: one failure never blocks the rest of the batch."""
         processed_files: list[Path] = []
         failures: list[DocumentIndexFailure] = []
         total_files = len(new_files)
@@ -390,21 +482,7 @@ class DocumentAdder:
                 success = await rag_service.add_documents(self.kb_name, [str(doc_file)])
                 if success:
                     processed_files.append(doc_file)
-                    # Re-hashes the whole file, so it stays off the event loop:
-                    # this runs inside a FastAPI BackgroundTasks entry, which is
-                    # awaited on the loop and would otherwise stall unrelated
-                    # requests once per indexed file (#777).
-                    try:
-                        await asyncio.to_thread(self._record_successful_hash, doc_file)
-                    except Exception:
-                        if self.rag_provider != LIGHTRAG_PROVIDER:
-                            raise
-                        logger.warning(
-                            "LightRAG published '%s' before its duplicate-detection hash "
-                            "was recorded",
-                            doc_file.name,
-                            exc_info=True,
-                        )
+                    await self._record_hash_after_index(doc_file)
                     logger.info(f"Processed: {doc_file.name}")
                     if self.progress_tracker is not None:
                         self.progress_tracker.update(
