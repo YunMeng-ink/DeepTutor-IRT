@@ -35,6 +35,7 @@ from .._turn_runtime_shared import (
     _format_selection_tutor_context,
     _mastery_action_context,
     _mastery_path_id,
+    _needs_content_offset,
     _partner_group_references,
     _reading_action_context,
     _reading_material_id,
@@ -1048,8 +1049,11 @@ class TurnExecutor:
                     # text. Persist the exact boundary each one sat at so a
                     # reloaded turn lays the answer out the way it streamed,
                     # and so future context can replay assistant -> user ->
-                    # assistant in order.
-                    _stamp_content_offset(payload_event, _persisted_answer())
+                    # assistant in order. Assembling the answer is only worth
+                    # it for those two event kinds — doing it per token chunk
+                    # made the cost quadratic over a long answer.
+                    if _needs_content_offset(payload_event):
+                        _stamp_content_offset(payload_event, _persisted_answer())
                     assistant_events.append(payload_event)
                 if _should_capture_assistant_content(event):
                     call_id = (event.metadata or {}).get("call_id")

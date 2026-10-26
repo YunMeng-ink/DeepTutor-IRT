@@ -15,6 +15,7 @@ from deeptutor.services.session.turn_runtime import (
     _extract_selection_tutor_context,
     _format_followup_question_context,
     _format_selection_tutor_context,
+    _needs_content_offset,
     _repair_chinese_emphasis_for_persistence,
     _resolve_selection_tutor_context,
     _retracted_round_call_id,
@@ -206,6 +207,22 @@ def test_plain_progress_event_gets_no_boundary() -> None:
     _stamp_content_offset(event, "Some answer text.")
 
     assert "assistant_content_offset" not in event["metadata"]
+
+
+def test_content_offset_predicate_matches_the_events_that_need_a_boundary() -> None:
+    """The streaming loop gates answer assembly on this predicate.
+
+    It must stay exactly as wide as _stamp_content_offset's own rule, or a
+    reloaded turn loses the layout anchors it stamps.
+    """
+    assert _needs_content_offset({"type": "progress", "metadata": {"ask_user_resolved": True}})
+    assert _needs_content_offset({"type": "tool_call", "metadata": {"call_id": "c1"}})
+    # Content chunks (the overwhelming majority of events) need no boundary.
+    assert not _needs_content_offset({"type": "content", "metadata": {}})
+    assert not _needs_content_offset({"type": "thinking", "metadata": {}})
+    assert not _needs_content_offset({"type": "progress", "metadata": {"trace_kind": "llm_chunk"}})
+    assert not _needs_content_offset({"type": "tool_call", "metadata": None})
+    assert not _needs_content_offset({"type": "tool_call"})
 
 
 # ---------------------------------------------------------------------------

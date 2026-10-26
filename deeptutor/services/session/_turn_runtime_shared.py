@@ -279,6 +279,20 @@ def _repair_chinese_emphasis_for_persistence(content: str, language: str) -> str
     )
 
 
+def _needs_content_offset(payload_event: dict[str, Any]) -> bool:
+    """Whether this event carries a replay boundary (see _stamp_content_offset).
+
+    Two kinds of event do: a resolved ``ask_user`` card, and the start of a
+    tool call. Both are rendered between runs of answer text.
+    """
+    metadata = payload_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("ask_user_resolved")) or (
+        payload_event.get("type") == StreamEventType.TOOL_CALL.value
+    )
+
+
 def _stamp_content_offset(
     payload_event: dict[str, Any],
     assistant_content: str,
@@ -292,17 +306,14 @@ def _stamp_content_offset(
     tool call and card would pile up at one end and the reload would not
     resemble what the reader watched.
 
-    Two kinds of event carry the mark: a resolved ``ask_user`` card, and the
-    start of a tool call. Both are rendered between runs of answer text.
+    Callers streaming token-by-token should gate on :func:`_needs_content_offset`
+    first: assembling and cleaning the whole answer just to read its length is
+    quadratic over a long turn.
     """
-    metadata = payload_event.get("metadata")
-    if not isinstance(metadata, dict):
+    if not _needs_content_offset(payload_event):
         return
-    anchors_layout = bool(metadata.get("ask_user_resolved")) or (
-        payload_event.get("type") == StreamEventType.TOOL_CALL.value
-    )
-    if anchors_layout:
-        metadata.setdefault("assistant_content_offset", len(assistant_content))
+    metadata = payload_event["metadata"]
+    metadata.setdefault("assistant_content_offset", len(assistant_content))
 
 
 def _clip_text(value: str, limit: int = 4000) -> str:
