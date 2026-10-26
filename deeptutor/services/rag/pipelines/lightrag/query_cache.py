@@ -86,11 +86,45 @@ def _evict_overflow_locked() -> list[Any]:
 
 
 async def discard(key: QueryCacheKey, rag: Any) -> None:
-    """Drop *rag* after a failed query so the next search starts clean."""
-    with _registry_lock:
-        removed = _entries.pop(key, None)
-    if removed is not None:
-        await _shutdown(rag)
+    """Drop *rag* after a failed query so the next search starts clean.
+
+    The finalize runs under the key's lock: a caller that was just cancelled
+    unwinds immediately, but a retried query for the same key waits until the
+    old instance has released its storages instead of building a second one
+    over the same working directory.
+    """
+    task = asyncio.ensure_future(_discard_locked(key, rag))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cleanup continues on the worker loop under the key lock.
+        raise
+    except BaseException:
+        logger.warning("LightRAG query instance cleanup failed", exc_info=True)
+
+
+async def _discard_locked(key: QueryCacheKey, rag: Any) -> None:
+    async with _key_lock(key):
+        with _registry_lock:
+            # Only close the instance this call owns. If the entry was already
+            # replaced (a newer build won the race) or evicted, its new owner
+            # or the eviction path is responsible for it.
+            if _entries.get(key) is not rag:
+                return
+            _entries.pop(key, None)
+        await _finalize(rag)
+
+
+async def close_instance(rag: Any) -> None:
+    """Best-effort release for an instance that never reached the cache.
+
+    A build that fails after `initialize_storages()` has storages open that
+    nobody else can close, so the builder hands it back here.
+    """
+    try:
+        await _finalize(rag)
+    except BaseException:
+        logger.warning("LightRAG query instance cleanup failed", exc_info=True)
 
 
 async def evict_root(root: Any) -> None:
@@ -154,6 +188,7 @@ __all__ = [
     "acquire",
     "cached_roots",
     "clear",
+    "close_instance",
     "discard",
     "evict_root",
 ]

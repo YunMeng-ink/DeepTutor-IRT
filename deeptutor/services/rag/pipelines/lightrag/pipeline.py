@@ -676,7 +676,13 @@ class LightRagPipeline:
                         query_roles=query_roles,
                         embedding_config=embedding_config,
                     )
-                    await engine.initialize(rag)
+                    try:
+                        await engine.initialize(rag)
+                    except BaseException:
+                        # initialize_storages() may have opened some stores
+                        # before failing; nobody else holds this instance.
+                        await query_cache.close_instance(rag)
+                        raise
                     return rag
 
                 rag = await query_cache.acquire(cache_key, build)

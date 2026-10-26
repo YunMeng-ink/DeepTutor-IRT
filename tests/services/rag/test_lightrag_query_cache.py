@@ -205,3 +205,40 @@ def test_version_stamp_tracks_meta_writes(tmp_path: Path) -> None:
     assert second is not None
     assert second != first
     assert _version_stamp(tmp_path / "missing") is None
+
+
+@pytest.mark.asyncio
+async def test_discard_leaves_a_replaced_entry_alone(finalize_calls) -> None:
+    """A failed query must not tear down the instance that replaced it."""
+
+    async def build(name: str):
+        async def factory() -> _FakeInstance:
+            return _FakeInstance(name)
+
+        return factory
+
+    key = _key("version-1")
+    stale = await query_cache.acquire(key, await build("stale"))
+    await query_cache.clear()  # simulates eviction; finalize recorded
+    replacement = await query_cache.acquire(key, await build("replacement"))
+
+    await query_cache.discard(key, stale)
+
+    assert query_cache.cached_roots() == ["version-1"]
+    assert "replacement" not in finalize_calls
+
+    # The replacement still answers from the cache.
+    async def failing_factory() -> _FakeInstance:
+        raise AssertionError("replacement should have been cached")
+
+    assert await query_cache.acquire(key, failing_factory) is replacement
+
+
+@pytest.mark.asyncio
+async def test_close_instance_releases_a_never_cached_instance(finalize_calls) -> None:
+    rag = _FakeInstance("half-initialized")
+
+    await query_cache.close_instance(rag)
+
+    assert finalize_calls == ["half-initialized"]
+    assert query_cache.cached_roots() == []
