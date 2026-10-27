@@ -131,6 +131,33 @@ async def test_interrupted_provider_call_is_recorded_and_propagates():
     assert records[0]["summaries"][0]["call_details"][0]["status"] == "interrupted"
 
 
+def test_ledger_recreates_schema_after_database_file_is_deleted(tmp_path):
+    path = tmp_path / "usage.sqlite3"
+    call = {
+        "call_id": "first",
+        "model": "m",
+        "provider": "p",
+        "status": "completed",
+        "estimated": False,
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    usage_ledger.record_call(path, call, started_at=1.0)
+    path.unlink()
+
+    usage_ledger.record_call(
+        path,
+        {**call, "call_id": "second"},
+        started_at=2.0,
+    )
+
+    records = usage_ledger.usage_records(0, 10, path=path)
+    assert [record["summaries"][0]["call_details"][0]["call_id"] for record in records] == [
+        "second"
+    ]
+
+
 def test_perplexity_search_records_its_separate_llm_transport(monkeypatch):
     from deeptutor.services.search.providers.perplexity import PerplexityProvider
 

@@ -10,7 +10,23 @@ from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any
+
+# Schema setup is idempotent but not free: three DDL statements plus a WAL
+# pragma on every LLM call. Once a database has been prepared in this process,
+# later calls only insert. The path is re-checked cheaply on a missing-table
+# error (the file was deleted underneath us).
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
+
+_SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS llm_calls (
+        call_id TEXT PRIMARY KEY, started_at REAL NOT NULL,
+        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, source TEXT NOT NULL,
+        usage_json TEXT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_time ON llm_calls(started_at)",
+)
 
 _CALL_FIELDS = frozenset(
     {
@@ -52,25 +68,45 @@ def record_call(
     from deeptutor.utils.secret_files import ensure_private_directory, ensure_private_file
 
     ensure_private_directory(path.parent)
-    with closing(sqlite3.connect(path, timeout=5)) as conn, conn:
-        ensure_private_file(path)
+    key = str(path)
+    payload = json.dumps(
+        {k: v for k, v in call.items() if k in _CALL_FIELDS}, allow_nan=False
+    )
+    values = (
+        call["call_id"],
+        started_at,
+        session_id,
+        turn_id,
+        source,
+        payload,
+    )
+
+    def _prepare(conn: sqlite3.Connection) -> None:
+        if key in _schema_ready:
+            return
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS llm_calls (
-            call_id TEXT PRIMARY KEY, started_at REAL NOT NULL,
-            session_id TEXT NOT NULL, turn_id TEXT NOT NULL, source TEXT NOT NULL,
-            usage_json TEXT NOT NULL)""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_calls_time ON llm_calls(started_at)")
-        conn.execute(
-            """INSERT OR IGNORE INTO llm_calls VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                call["call_id"],
-                started_at,
-                session_id,
-                turn_id,
-                source,
-                json.dumps({k: v for k, v in call.items() if k in _CALL_FIELDS}, allow_nan=False),
-            ),
-        )
+        for statement in _SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        with _schema_lock:
+            _schema_ready.add(key)
+
+    for attempt in range(2):
+        try:
+            with closing(sqlite3.connect(path, timeout=5)) as conn, conn:
+                ensure_private_file(path)
+                _prepare(conn)
+                conn.execute(
+                    """INSERT OR IGNORE INTO llm_calls VALUES (?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            return
+        except sqlite3.OperationalError as exc:
+            # The database file was deleted while this process ran: recreate
+            # the schema once instead of dropping every subsequent call.
+            if attempt or "no such table" not in str(exc).lower():
+                raise
+            with _schema_lock:
+                _schema_ready.discard(key)
 
 
 def usage_records(
