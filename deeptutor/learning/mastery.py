@@ -22,10 +22,13 @@ mastery score:
    answer or two can never declare a point mastered.
 
 Calibration anchors (default medium items, guessing 0.1): one correct
--> 0.5 (cap), two correct -> 0.8 (cap), three correct -> ~0.91 (clears the
-0.9 gate), and a recent window of five correct -> ~0.95. A single miss
-scores ~0.22 — low, but no longer a hard zero, because under a Bayesian
-model one miss is thin evidence about ability, not proof of none.
+-> 0.5 (cap), one partial-credit answer -> ~0.46 (above a miss, below the
+one-attempt cap, because the guessing floor places a raw half-credit
+response at a slightly negative ability), two correct -> 0.8 (cap), three
+correct -> ~0.91 (clears the 0.9 gate), and a recent window of five correct
+-> ~0.95. A single miss scores ~0.22 — low, but no longer a hard zero,
+because under a Bayesian model one miss is thin evidence about ability, not
+proof of none.
 
 This is the one place the pedagogy math lives. The estimator may be swapped
 again (a calibrated item bank, BKT, ...) by replacing ``compute_mastery``

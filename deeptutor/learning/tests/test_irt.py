@@ -170,6 +170,20 @@ def test_partial_credit_lands_between_wrong_and_right():
     assert compute_mastery([False] * 3) < compute_mastery([0.5] * 3) < compute_mastery([True] * 3)
 
 
+def test_one_partial_sits_below_the_one_attempt_cap():
+    """The 0.5 cap is an upper bound, not the value of a partial answer.
+
+    The guessing floor places a raw half-credit response at a slightly
+    negative ability, so the calibrated reference score is just below 0.5 —
+    still above a miss and below a fully correct one-attempt answer.
+    """
+    partial = compute_mastery([0.5])
+    correct = compute_mastery([True])
+
+    assert compute_mastery([False]) < partial < correct
+    assert correct == 0.5
+
+
 def test_out_of_range_correctness_is_clamped():
     assert compute_mastery([7.0]) == compute_mastery([True])
     assert compute_mastery([-3.0]) == compute_mastery([False])

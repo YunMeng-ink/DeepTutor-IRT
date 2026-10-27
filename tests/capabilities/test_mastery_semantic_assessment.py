@@ -2,6 +2,7 @@
 
 import pytest
 
+from deeptutor.learning.mastery import compute_mastery
 from deeptutor.learning.models import InteractionStatus
 from deeptutor.learning.service import MasteryInteractionError
 from tests.capabilities.test_mastery_question_groups import group, leaf
@@ -224,7 +225,11 @@ async def test_partial_has_own_evidence_without_error_record(service, monkeypatc
     assert interaction.result["is_correct"] is None
     assert progress.quiz_attempts[0].result == "partial"
     assert progress.learning_evidence[0].result == "partial"
-    assert progress.mastery_levels["kp1"] == 0.5
+    # A partial answer is real evidence, but the one-attempt 0.5 cap is an
+    # upper bound, not a floor: the IRT estimate lands just below it.
+    level = progress.mastery_levels["kp1"]
+    assert level == pytest.approx(compute_mastery([0.5]))
+    assert 0.0 < level < 0.5
     assert not progress.error_records
 
 
