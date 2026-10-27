@@ -689,3 +689,57 @@ class TestContextBuilderSummarizePaths:
         assert result.conversation_summary == ""
         assert all(m["role"] != "system" for m in result.conversation_history)
         store.update_summary.assert_not_called()
+
+
+class TestTokenCountCache:
+    def test_repeated_counts_skip_the_encoder(self, monkeypatch) -> None:
+        from deeptutor.services.session import context_builder
+
+        context_builder.reset_token_count_cache()
+        text = "A router forwards packets between networks. " * 200
+
+        first = context_builder.count_tokens(text)
+
+        calls = {"count": 0}
+        original = context_builder._encode_token_count
+
+        def counting(value: str) -> int:
+            calls["count"] += 1
+            return original(value)
+
+        monkeypatch.setattr(context_builder, "_encode_token_count", counting)
+
+        assert context_builder.count_tokens(text) == first
+        assert context_builder.count_tokens(text) == first
+        assert calls["count"] == 0
+
+    def test_different_texts_stay_independent(self) -> None:
+        from deeptutor.services.session import context_builder
+
+        context_builder.reset_token_count_cache()
+
+        short = context_builder.count_tokens("hello")
+        long = context_builder.count_tokens("hello " * 100)
+
+        assert short < long
+        assert context_builder.count_tokens("hello") == short
+
+    def test_empty_text_never_encodes(self, monkeypatch) -> None:
+        from deeptutor.services.session import context_builder
+
+        def boom(_value: str) -> int:
+            raise AssertionError("empty text must not reach the encoder")
+
+        monkeypatch.setattr(context_builder, "_encode_token_count", boom)
+        assert context_builder.count_tokens("") == 0
+
+    def test_cache_is_bounded(self, monkeypatch) -> None:
+        from deeptutor.services.session import context_builder
+
+        context_builder.reset_token_count_cache()
+        monkeypatch.setattr(context_builder, "_TOKEN_CACHE_MAX", 4)
+
+        for index in range(10):
+            context_builder.count_tokens(f"unique text {index}")
+
+        assert len(context_builder._token_cache) <= 4

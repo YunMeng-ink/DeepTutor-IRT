@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
+import hashlib
 import json
 import logging
 import re
+import threading
 from typing import Any, Awaitable, Callable
 
 from deeptutor.agents.base_agent import BaseAgent
@@ -100,10 +103,19 @@ def sanitize_summary(text: str) -> str:
     return _OPEN_THINK_RE.sub("", cleaned).replace("</think>", "").strip() or raw
 
 
-def count_tokens(text: str) -> int:
-    """Estimate token count with tiktoken when available."""
-    if not text:
-        return 0
+#: How many distinct texts keep their token count memoized. Counts are tiny
+#: values; only a 128-bit digest of each text is retained, never the text.
+_TOKEN_CACHE_MAX = 8192
+_token_cache: OrderedDict[tuple[int, str], int] = OrderedDict()
+_token_cache_lock = threading.Lock()
+
+
+def _token_cache_key(text: str) -> tuple[int, str]:
+    encoded = text.encode("utf-8", "surrogatepass")
+    return (len(encoded), hashlib.blake2b(encoded, digest_size=16).hexdigest())
+
+
+def _encode_token_count(text: str) -> int:
     try:
         import tiktoken
 
@@ -111,6 +123,34 @@ def count_tokens(text: str) -> int:
         return len(encoding.encode(text))
     except Exception:
         return max(1, len(text) // 4)
+
+
+def count_tokens(text: str) -> int:
+    """Estimate token count with tiktoken when available.
+
+    Memoized by content digest: the loop re-counts the same history messages
+    before every round, and the binary search in ``_select_recent_messages``
+    re-counts overlapping tails. Encoding is the expensive half of both.
+    """
+    if not text:
+        return 0
+    key = _token_cache_key(text)
+    with _token_cache_lock:
+        cached = _token_cache.get(key)
+        if cached is not None:
+            _token_cache.move_to_end(key)
+            return cached
+    value = _encode_token_count(text)
+    with _token_cache_lock:
+        _token_cache[key] = value
+        while len(_token_cache) > _TOKEN_CACHE_MAX:
+            _token_cache.popitem(last=False)
+    return value
+
+
+def reset_token_count_cache() -> None:
+    with _token_cache_lock:
+        _token_cache.clear()
 
 
 def _count_model_context_tokens(value: Any) -> int:
