@@ -5,14 +5,17 @@ SQLite-backed unified chat session store.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 from typing import Any
 import uuid
@@ -40,6 +43,10 @@ from deeptutor.utils.secret_files import ensure_private_directory, ensure_privat
 
 from .ask_user_trace import select_ask_user_events
 from .event_preview import MAX_TRACE_PREVIEW_EVENTS, compact_trace_preview
+
+# Settled turns' previews are immutable and are rebuilt on every history read;
+# memoize a bounded number of them per store instance.
+_PREVIEW_CACHE_MAX_ENTRIES = 64
 from .provider_response_state import redact_private_message_metadata
 from .search import bounded_search_excerpt, normalize_search_query
 from .workspace_preferences import upgrade_workspace_preferences
@@ -271,6 +278,10 @@ class SQLiteSessionStore:
         # one slow write (an event flush, a subscriber poll) stalled unrelated
         # sessions. A bounded slot count caps parallel connections instead.
         self._op_slots = asyncio.Semaphore(self._MAX_CONCURRENT_DB_OPS)
+        self._preview_cache: OrderedDict[
+            tuple[Any, ...], tuple[list[dict[str, Any]], dict[str, Any]]
+        ] = OrderedDict()
+        self._preview_cache_lock = threading.Lock()
         with _migration_lock(self.db_path):
             self._initialize()
         ensure_private_file(self.db_path)
@@ -1130,6 +1141,28 @@ class SQLiteSessionStore:
     async def _run(self, fn, *args):
         async with self._op_slots:
             return await asyncio.to_thread(fn, *args)
+
+    def _cached_preview(
+        self, key: tuple[Any, ...]
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        with self._preview_cache_lock:
+            entry = self._preview_cache.get(key)
+            if entry is None:
+                return None
+            self._preview_cache.move_to_end(key)
+            return deepcopy(entry)
+
+    def _store_cached_preview(
+        self,
+        key: tuple[Any, ...],
+        events: list[dict[str, Any]],
+        metadata: dict[str, Any],
+    ) -> None:
+        with self._preview_cache_lock:
+            self._preview_cache[key] = (deepcopy(events), deepcopy(metadata))
+            self._preview_cache.move_to_end(key)
+            while len(self._preview_cache) > _PREVIEW_CACHE_MAX_ENTRIES:
+                self._preview_cache.popitem(last=False)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -2621,6 +2654,14 @@ class SQLiteSessionStore:
             """,
             (turn_id,),
         ).fetchone()
+        # A settled turn's preview cannot change, and history is read several
+        # times per turn (context build, inventory, image collection). The
+        # scans below scan every event of the turn twice and json_extract each
+        # row, so build the preview once per (turn, last_seq, total).
+        cache_key = ("preview", turn_id, int(stats["last_seq"]), int(stats["total"]))
+        cached = self._cached_preview(cache_key)
+        if cached is not None:
+            return cached[0], dict(cached[1])
         # Preview queries stay bounded even for a very long agentic turn. The
         # critical query reserves older terminal/result/card state; the
         # semantic query fills the remaining tail with tool activity. Both card
@@ -2671,6 +2712,7 @@ class SQLiteSessionStore:
             # the whole turn (it renders as "0s").
             **_trace_bounds(stats["started_at"], stats["ended_at"]),
         }
+        self._store_cached_preview(cache_key, preview, metadata)
         return preview, metadata
 
     def _legacy_trace_preview_sync(
@@ -2691,6 +2733,18 @@ class SQLiteSessionStore:
     def _ask_user_events_sync(
         self, conn: sqlite3.Connection, turn_id: str, session_id: str
     ) -> list[dict[str, Any]]:
+        # Context reads ask for the same settled turn's cards repeatedly. The
+        # filtered scan parses metadata for every event of the turn, so cache
+        # the result against the turn's current high-water sequence.
+        last_seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS last_seq FROM turn_events WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+        cache_key = ("ask_user", turn_id, session_id, int(last_seq["last_seq"]))
+        cached = self._cached_preview(cache_key)
+        if cached is not None:
+            return [dict(event) for event in cached[0]]
+
         rows = conn.execute(
             """
             SELECT turn_id, seq, type, source, stage, content, metadata_json, timestamp
@@ -2709,6 +2763,7 @@ class SQLiteSessionStore:
         events = [self._turn_event_row_to_payload(row) for row in reversed(rows)]
         for event in events:
             event["session_id"] = session_id
+        self._store_cached_preview(cache_key, events, {})
         return events
 
     def _get_messages_sync(self, session_id: str) -> list[dict[str, Any]]:

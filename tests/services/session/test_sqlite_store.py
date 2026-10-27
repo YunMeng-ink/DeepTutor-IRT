@@ -1307,3 +1307,61 @@ def test_concurrency_slots_are_released_after_failure(tmp_path: Path) -> None:
         assert sorted(results) == list(range(store._MAX_CONCURRENT_DB_OPS))
 
     asyncio.run(_main())
+
+
+def test_trace_preview_is_built_once_per_settled_turn(tmp_path: Path, monkeypatch) -> None:
+    """History is read several times per turn; the preview scans must not repeat."""
+    store = SQLiteSessionStore(tmp_path / "store.db")
+
+    async def _main() -> tuple[list[dict], list[dict], int, int]:
+        session = await store.create_session("cached")
+        turn = await store.create_turn(session["id"], capability="chat")
+        await store.append_events(
+            turn["id"],
+            [
+                {"type": "content", "content": "hi", "seq": 1},
+                {"type": "done", "content": "hi", "seq": 2},
+            ],
+        )
+
+        calls = {"count": 0}
+        original = store._turn_event_row_to_payload
+
+        def counting(row):
+            calls["count"] += 1
+            return original(row)
+
+        monkeypatch.setattr(store, "_turn_event_row_to_payload", counting)
+        with store._connect() as conn:
+            first = store._canonical_trace_preview_sync(conn, turn["id"], session["id"])
+            after_first = calls["count"]
+            second = store._canonical_trace_preview_sync(conn, turn["id"], session["id"])
+        return first[0], second[0], after_first, calls["count"]
+
+    first_events, second_events, after_first, after_second = asyncio.run(_main())
+
+    assert after_first > 0
+    assert after_second == after_first  # second read served from the cache
+    assert [e["seq"] for e in first_events] == [e["seq"] for e in second_events]
+
+
+def test_appending_events_moves_the_preview_to_a_new_cache_entry(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path / "store.db")
+
+    async def _main() -> tuple[int, int]:
+        session = await store.create_session("growing")
+        turn = await store.create_turn(session["id"], capability="chat")
+        await store.append_events(turn["id"], [{"type": "content", "content": "first", "seq": 1}])
+
+        with store._connect() as conn:
+            before = store._canonical_trace_preview_sync(conn, turn["id"], session["id"])
+
+        await store.append_events(turn["id"], [{"type": "done", "content": "final", "seq": 2}])
+        with store._connect() as conn:
+            after = store._canonical_trace_preview_sync(conn, turn["id"], session["id"])
+        return before[1]["last_seq"], after[1]["last_seq"]
+
+    before_seq, after_seq = asyncio.run(_main())
+
+    assert before_seq == 1
+    assert after_seq == 2
