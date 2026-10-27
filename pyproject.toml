@@ -26,16 +26,12 @@ dependencies = [
     "httpx>=0.27.0",
     "requests>=2.32.2",
     "ddgs>=9.9.1",
-    "nest_asyncio>=1.5.8",
-    "tenacity>=8.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "packaging>=24.2",
     "jsonschema>=4.20.0,<5.0.0",
-    "aiosqlite>=0.19.0",
     "typer>=0.9.0",
     "rich>=13.0.0",
-    "prompt_toolkit>=3.0.36",
     "pyte>=0.8.1",  # in-memory terminal emulator: scrape Claude Code's /model TUI on sync
     # MCP client. Core rather than a `partners`-only extra (issue #792): the
     # default chat/tool surface includes configurable MCP servers, so a plain
@@ -57,7 +53,6 @@ dependencies = [
     "anthropic>=0.30.0",
     "dashscope>=1.14.0",
     "perplexityai>=0.1.0",
-    "oauth-cli-kit>=0.1.1",
     "llama-index>=0.14.12",
     # The current BM25 integration pins PyStemmer <3, whose 2.x line has no
     # Python 3.14 wheels. Skip it there so ordinary installs never require a C
@@ -121,7 +116,6 @@ cli = [
     "anthropic>=0.30.0",
     "dashscope>=1.14.0",
     "perplexityai>=0.1.0",
-    "oauth-cli-kit>=0.1.1",
     "pageindex>=0.2.10,<0.3.0",
     # RAG (LlamaIndex)
     "llama-index>=0.14.12",
@@ -321,6 +315,9 @@ version = {attr = "deeptutor.__version__.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["deeptutor*", "deeptutor_cli*"]
+# In-package tests stay in the source tree (pytest's testpaths) but do not
+# belong in the installed wheel.
+exclude = ["deeptutor.learning.tests"]
 
 [tool.setuptools.package-data]
 # Runtime data shipped inside the deeptutor package: prompt YAMLs (loaded by
@@ -338,7 +335,7 @@ deeptutor = [
     "**/*.jinja",
 ]
 deeptutor_cli = ["**/*.md"]
-deeptutor_web = ["**/*", ".next/**/*"]
+deeptutor_web = ["**/*"]
 
 # ============================================
 # Black code formatter configuration
