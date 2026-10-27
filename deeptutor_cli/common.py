@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import signal
 import sys
-from typing import Any, Callable, Iterator, TextIO
+from typing import TYPE_CHECKING, Any, Callable, Iterator, TextIO
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -17,9 +17,11 @@ from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
-from deeptutor.app import DeepTutorApp, TurnRequest
-
 from ._tool_result import ToolResultBuffer, ToolResultEntry
+
+if TYPE_CHECKING:
+    from deeptutor.app import DeepTutorApp
+    from deeptutor.core.turn_request import TurnRequest
 
 console = Console()
 
@@ -839,6 +841,10 @@ def build_turn_request(
     notebook_refs: list[str],
     history_refs: list[str],
 ) -> TurnRequest:
+    # pydantic's model machinery is only needed once a turn is actually built;
+    # deferring it keeps `deeptutor --help` and non-turn commands fast.
+    from deeptutor.core.turn_request import TurnRequest
+
     config = parse_json_object(config_json)
     config.update(parse_config_items(config_items))
     return TurnRequest(

@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 import webbrowser
 
 import httpx
 import typer
 
-from deeptutor.services.codex_auth import CodexAuthError, get_codex_oauth_service
-
 from .common import maybe_run
+
+
+# Indirection so the Codex auth stack (and the model catalog behind it) loads
+# only for `deeptutor provider login`; the module-level name also keeps the
+# seam tests patch.
+def get_codex_oauth_service() -> Any:
+    from deeptutor.services.codex_auth import get_codex_oauth_service as impl
+
+    return impl()
 
 
 def register(app: typer.Typer) -> None:
@@ -41,6 +49,8 @@ def register(app: typer.Typer) -> None:
 
 
 async def _login_openai_codex() -> None:
+    from deeptutor.services.codex_auth import CodexAuthError
+
     service = get_codex_oauth_service()
     try:
         started = await service.start_login()

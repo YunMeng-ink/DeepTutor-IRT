@@ -12,8 +12,6 @@ from rich.panel import Panel
 from rich.text import Text
 import typer
 
-from deeptutor.app import DeepTutorApp, TurnRequest
-
 from .common import (
     console,
     maybe_run,
@@ -84,6 +82,8 @@ def register(app: typer.Typer) -> None:
 
 
 async def _chat_repl(state: ChatState) -> None:
+    from deeptutor.app import DeepTutorApp
+
     client = (
         DeepTutorApp(workspace_id=state.workspace_id)
         if state.workspace_id is not None
@@ -169,6 +169,8 @@ async def _chat_repl(state: ChatState) -> None:
                 if should_continue:
                     continue
                 break
+
+            from deeptutor.core.turn_request import TurnRequest
 
             request = TurnRequest(
                 content=user_input,

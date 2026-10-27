@@ -19,7 +19,22 @@ import httpx
 from rich.console import Console
 import typer
 
-from . import init_wizard as wiz
+
+class _LazyWizard:
+    """Resolve the interactive wizard module on first use.
+
+    The wizard pulls the provider registry and LLM config machinery at import
+    time — a few hundred milliseconds every ``deeptutor`` invocation would
+    otherwise pay, though only ``deeptutor init`` needs it.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        from . import init_wizard
+
+        return getattr(init_wizard, name)
+
+
+wiz = _LazyWizard()
 
 
 def _reset_runtime_singletons() -> None:

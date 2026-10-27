@@ -7,9 +7,6 @@ from pathlib import Path
 
 import typer
 
-from deeptutor.app import DeepTutorApp
-from deeptutor.services.notebook.service import NotebookCorruptedError
-
 from .common import console, print_notebook_table
 
 
@@ -17,6 +14,8 @@ def register(app: typer.Typer) -> None:
     @app.command("list")
     def list_notebooks() -> None:
         """List notebooks."""
+        from deeptutor.app import DeepTutorApp
+
         client = DeepTutorApp()
         print_notebook_table(client.list_notebooks())
 
@@ -26,6 +25,8 @@ def register(app: typer.Typer) -> None:
         description: str = typer.Option("", "--description", help="Notebook description."),
     ) -> None:
         """Create a notebook."""
+        from deeptutor.app import DeepTutorApp
+
         client = DeepTutorApp()
         notebook = client.create_notebook(name=name, description=description)
         console.print(json.dumps(notebook, ensure_ascii=False, indent=2, default=str))
@@ -36,6 +37,9 @@ def register(app: typer.Typer) -> None:
         fmt: str = typer.Option("rich", "--format", help="Output format: rich | json."),
     ) -> None:
         """Show a notebook and its records."""
+        from deeptutor.app import DeepTutorApp
+        from deeptutor.services.notebook.service import NotebookCorruptedError
+
         client = DeepTutorApp()
         try:
             notebook = client.get_notebook(notebook_id)
@@ -64,6 +68,9 @@ def register(app: typer.Typer) -> None:
         record_id: str = typer.Argument(..., help="Record id."),
     ) -> None:
         """Delete a notebook record."""
+        from deeptutor.app import DeepTutorApp
+        from deeptutor.services.notebook.service import NotebookCorruptedError
+
         client = DeepTutorApp()
         try:
             success = client.remove_record(notebook_id, record_id)
@@ -95,6 +102,8 @@ def register(app: typer.Typer) -> None:
         content = path.read_text(encoding="utf-8")
         record_title = title or path.stem
 
+        from deeptutor.app import DeepTutorApp
+
         client = DeepTutorApp()
         result = client.add_record(
             notebook_ids=[notebook_id],
@@ -122,6 +131,8 @@ def register(app: typer.Typer) -> None:
             raise typer.Exit(code=1)
 
         content = path.read_text(encoding="utf-8")
+
+        from deeptutor.app import DeepTutorApp
 
         client = DeepTutorApp()
         updated = client.update_record(notebook_id, record_id, output=content)

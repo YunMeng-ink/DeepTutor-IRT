@@ -16,11 +16,11 @@ from rich.console import Console
 from rich.table import Table
 import typer
 
-from deeptutor.knowledge.manager import KnowledgeBaseManager
 from deeptutor.knowledge.naming import validate_knowledge_base_name
-from deeptutor.services.path_service import get_path_service
 from deeptutor.services.rag.factory import DEFAULT_PROVIDER
-from deeptutor.services.rag.file_routing import FileTypeRouter
+
+if TYPE_CHECKING:
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type annotations only
     from deeptutor.services.rag.eval import EvalDataset, EvalReport, ProgressFn, QueryEvaluation
@@ -30,6 +30,9 @@ console = Console()
 
 def _get_kb_manager() -> KnowledgeBaseManager:
     """Return a KnowledgeBaseManager rooted at the canonical project-level KB directory."""
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
+    from deeptutor.services.path_service import get_path_service
+
     base_dir = get_path_service().project_root / "data" / "knowledge_bases"
     return KnowledgeBaseManager(base_dir=str(base_dir))
 
@@ -47,6 +50,8 @@ def _collect_documents(docs: list[str], docs_dir: Optional[str]) -> list[str]:
         base = Path(docs_dir).expanduser().resolve()
         if not base.exists() or not base.is_dir():
             raise typer.BadParameter(f"docs directory does not exist: {base}")
+        from deeptutor.services.rag.file_routing import FileTypeRouter
+
         candidates.extend(FileTypeRouter.collect_supported_files(base, recursive=True))
 
     unique: list[str] = []

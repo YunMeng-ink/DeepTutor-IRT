@@ -7,12 +7,22 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 import typer
 
-from deeptutor.services.memory import (
-    L3_SLOTS,
-    SURFACES,
-    get_memory_store,
-    paths,
-)
+
+class _LazyMemory:
+    """Resolve the memory subsystem on first use.
+
+    The store, consolidator and snapshot adapters are several hundred
+    milliseconds of imports that only ``deeptutor memory`` needs, not every
+    CLI invocation.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        from deeptutor.services import memory as service
+
+        return getattr(service, name)
+
+
+memory = _LazyMemory()
 
 console = Console()
 
@@ -26,7 +36,7 @@ def register(app: typer.Typer) -> None:
         ),
     ) -> None:
         """Display memory document content."""
-        store = get_memory_store()
+        store = memory.get_memory_store()
 
         if target == "L3":
             text = store.read_l3_concat()
@@ -34,7 +44,7 @@ def register(app: typer.Typer) -> None:
             return
 
         if target == "L2":
-            for surface in SURFACES:
+            for surface in memory.SURFACES:
                 content = store.read_raw("L2", surface)
                 if content.strip():
                     console.print(Panel(Markdown(content), title=f"[bold]L2/{surface}.md[/]"))
@@ -43,15 +53,15 @@ def register(app: typer.Typer) -> None:
             return
 
         # Single doc name — resolve to L2 or L3.
-        if target in L3_SLOTS:
+        if target in memory.L3_SLOTS:
             content = store.read_raw("L3", target)
             label = f"L3/{target}.md"
-        elif target in SURFACES:
+        elif target in memory.SURFACES:
             content = store.read_raw("L2", target)
             label = f"L2/{target}.md"
         else:
             console.print(
-                f"[red]Unknown doc: {target}. Use 'L2', 'L3', a surface ({', '.join(SURFACES)}), or a slot ({', '.join(L3_SLOTS)}).[/]"
+                f"[red]Unknown doc: {target}. Use 'L2', 'L3', a surface ({', '.join(memory.SURFACES)}), or a slot ({', '.join(memory.L3_SLOTS)}).[/]"
             )
             raise typer.Exit(1)
 
@@ -69,7 +79,7 @@ def register(app: typer.Typer) -> None:
         force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation."),
     ) -> None:
         """Clear memory (use 'all' for a full reset, or a surface name for L1 only)."""
-        if target != "all" and target != "trace" and target not in SURFACES:
+        if target != "all" and target != "trace" and target not in memory.SURFACES:
             console.print(f"[red]Unknown target: {target}[/]")
             raise typer.Exit(1)
 
@@ -79,7 +89,7 @@ def register(app: typer.Typer) -> None:
                 raise typer.Abort()
 
         if target == "all":
-            root = paths.memory_root()
+            root = memory.paths.memory_root()
             for entry in root.iterdir() if root.exists() else []:
                 if entry.is_file():
                     entry.unlink()
@@ -89,11 +99,11 @@ def register(app: typer.Typer) -> None:
                             child.unlink()
             console.print("[green]Cleared all memory.[/]")
         elif target == "trace":
-            for surface in SURFACES:
-                for f in paths.trace_dir(surface).glob("*.jsonl"):
+            for surface in memory.SURFACES:
+                for f in memory.paths.trace_dir(surface).glob("*.jsonl"):
                     f.unlink()
             console.print("[green]Cleared all L1 trace.[/]")
         else:
-            for f in paths.trace_dir(target).glob("*.jsonl"):  # type: ignore[arg-type]
+            for f in memory.paths.trace_dir(target).glob("*.jsonl"):  # type: ignore[arg-type]
                 f.unlink()
             console.print(f"[green]Cleared L1 trace for {target}.[/]")

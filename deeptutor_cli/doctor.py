@@ -4,17 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import TYPE_CHECKING, Any
 
 from rich.table import Table
 import typer
 
-from deeptutor.services.doctor import (
-    DoctorReport,
-    run_diagnostics,
-    run_runtime_diagnostics,
-)
-
 from .common import console
+
+if TYPE_CHECKING:
+    from deeptutor.services.doctor import DoctorReport
+
+
+# Thin indirections: the diagnostics stack (LLM config, provider probes) is
+# several hundred milliseconds of imports that only `deeptutor doctor` needs.
+# Keeping these as module-level names also keeps them patchable in tests.
+def run_diagnostics(**kwargs: Any) -> Any:
+    from deeptutor.services.doctor import run_diagnostics as impl
+
+    return impl(**kwargs)
+
+
+def run_runtime_diagnostics() -> Any:
+    from deeptutor.services.doctor import run_runtime_diagnostics as impl
+
+    return impl()
 
 
 def _render_rich(report: DoctorReport) -> None:
