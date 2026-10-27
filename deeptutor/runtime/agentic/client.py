@@ -65,6 +65,13 @@ _AGENTIC_CLIENT_POOL_MAXSIZE = 2
 _agentic_client_pool: "OrderedDict[tuple[Any, ...], Any]" = OrderedDict()
 _agentic_client_pool_lock = threading.RLock()
 
+# Mirrors the legacy ``complete_stream`` coalescing window. Providers emit one
+# chunk per token; forwarding each as its own turn event multiplies websocket
+# frames and persisted rows by ~15x for no visible benefit. The first chunk of
+# each channel still goes out immediately, so first-token latency is unchanged.
+_STREAM_COALESCE_CHARS = 64
+_STREAM_COALESCE_SECONDS = 0.04
+
 
 @dataclass(frozen=True)
 class LLMClientConfig:
@@ -483,6 +490,42 @@ def _provider_streams_tool_args(provider: Any) -> bool:
     return "on_tool_args_delta" in parameters
 
 
+def _coalescable_delta(chunk: Any) -> tuple[str, str] | None:
+    """Return ``("content"|"reasoning", text)`` for a pure text delta chunk.
+
+    Anything that carries structure the loop consumes — tool-call fragments,
+    finish reasons, usage, provider-specific fields, multiple choices — is not
+    coalescable and must reach the consumer as-is. Coalescing only these pure
+    text chunks is therefore semantically identical to delivering each token.
+    """
+    choices = getattr(chunk, "choices", None)
+    if not choices or len(choices) != 1:
+        return None
+    choice = choices[0]
+    if getattr(choice, "finish_reason", None):
+        return None
+    if getattr(choice, "provider_specific_fields", None):
+        return None
+    if getattr(chunk, "usage", None):
+        return None
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        return None
+    if getattr(delta, "tool_calls", None) or getattr(delta, "function_call", None):
+        return None
+    if getattr(delta, "refusal", None) or getattr(delta, "audio", None):
+        return None
+    content = getattr(delta, "content", None)
+    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+    if content and reasoning:
+        return None
+    if content:
+        return ("content", str(content))
+    if reasoning:
+        return ("reasoning", str(reasoning))
+    return None
+
+
 class _ProviderOpenAIStream:
     def __init__(
         self,
@@ -510,6 +553,13 @@ class _ProviderOpenAIStream:
         self._task: asyncio.Task[None] | None = None
         self._emitted_content = False
         self._emitted_reasoning = False
+        # Chunks handed back on the next call instead of reading the queue:
+        # a boundary chunk that ended a coalescing run, or the terminal
+        # ``None``/exception that run consumed.
+        self._pending: Any | None = None
+        self._pending_error: BaseException | None = None
+        self._pending_end = False
+        self._emitted_delta_kinds: set[str] = set()
 
     def __aiter__(self) -> "_ProviderOpenAIStream":
         if self._queue is None:
@@ -521,12 +571,57 @@ class _ProviderOpenAIStream:
         if self._queue is None:
             self.__aiter__()
         assert self._queue is not None
+        if self._pending is not None:
+            item, self._pending = self._pending, None
+            return item
+        if self._pending_error is not None:
+            error, self._pending_error = self._pending_error, None
+            raise error
+        if self._pending_end:
+            self._pending_end = False
+            raise StopAsyncIteration
         item = await self._queue.get()
         if item is None:
             raise StopAsyncIteration
         if isinstance(item, Exception):
             raise item
-        return item
+        delta = _coalescable_delta(item)
+        if delta is None:
+            return item
+        kind, text = delta
+        # Emit the first chunk of each channel immediately so the UI starts
+        # rendering at once; later chunks are coalesced.
+        if kind not in self._emitted_delta_kinds:
+            self._emitted_delta_kinds.add(kind)
+            return item
+        buffered = [text]
+        buffered_chars = len(text)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STREAM_COALESCE_SECONDS
+        while buffered_chars < _STREAM_COALESCE_CHARS:
+            timeout = deadline - loop.time()
+            if timeout <= 0:
+                break
+            try:
+                nxt = await asyncio.wait_for(self._queue.get(), timeout)
+            except asyncio.TimeoutError:
+                break
+            if nxt is None:
+                self._pending_end = True
+                break
+            if isinstance(nxt, Exception):
+                self._pending_error = nxt
+                break
+            nxt_delta = _coalescable_delta(nxt)
+            if nxt_delta is None or nxt_delta[0] != kind:
+                self._pending = nxt
+                break
+            buffered.append(nxt_delta[1])
+            buffered_chars += len(nxt_delta[1])
+        merged = "".join(buffered)
+        if kind == "reasoning":
+            return _openai_stream_chunk(reasoning_content=merged)
+        return _openai_stream_chunk(content=merged)
 
     async def close(self) -> None:
         if self._task and not self._task.done():

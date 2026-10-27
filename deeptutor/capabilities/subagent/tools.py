@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from deeptutor.capabilities.subagent.merge_throttle import MergeThrottle
 from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolParameter, ToolResult
 
 if TYPE_CHECKING:  # avoid importing the services package at module-load time (cycle)
@@ -123,8 +124,16 @@ class ConsultSubagentTool(BaseTool):
         consult_index = state["count"]
         event_sink = kwargs.get("event_sink")
 
+        async def _emit_trace(text: str, metadata: dict[str, Any]) -> None:
+            await event_sink(_TRACE_KIND, text, metadata)
+
+        # Backends report cumulative text, so the full answer is re-sent on
+        # every delta. Throttle those frames while keeping the last event's
+        # content complete; tool rows and question lines bypass it.
+        throttle = MergeThrottle(_emit_trace) if event_sink is not None else None
+
         async def _stream(channel: str, text: str, extra: dict[str, object] | None = None) -> None:
-            if event_sink is None or not text:
+            if event_sink is None or not text or throttle is None:
                 return
             metadata: dict[str, object] = {
                 "subagent_kind": backend.kind,
@@ -148,8 +157,13 @@ class ConsultSubagentTool(BaseTool):
             # several consults (which share one transcript).
             merge_id = (extra or {}).get("merge_id")
             if merge_id:
-                metadata["subagent_merge_id"] = f"{consult_index}:{merge_id}"
-            await event_sink(_TRACE_KIND, text, metadata)
+                namespaced = f"{consult_index}:{merge_id}"
+                metadata["subagent_merge_id"] = namespaced
+                if channel in {"text", "reasoning"}:
+                    await throttle.push(namespaced, text, metadata)
+                    return
+            await throttle.flush()
+            await _emit_trace(text, metadata)
 
         async def on_event(event: SubagentEvent) -> None:
             await _stream(event.kind, event.text, event.meta)
@@ -178,6 +192,13 @@ class ConsultSubagentTool(BaseTool):
             await _stream("error", str(exc))
             return ToolResult(content=f"The subagent run failed: {exc}", success=False)
         finally:
+            if throttle is not None:
+                try:
+                    await throttle.flush()
+                except Exception:
+                    # A trace sink failure must not fail the consult or skip
+                    # image cleanup.
+                    logger.warning("Failed to flush subagent transcript text", exc_info=True)
             if image_dir is not None:
                 import shutil
 
