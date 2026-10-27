@@ -8,12 +8,12 @@
 # Runtime data (knowledge bases, partner workspaces, memory, etc.)
 data/
 /multi-user/
-# Local development documents; public guides live in docs-for-user/.
-/docs/
+# Local-only design/QA notes; public guides live in docs-for-user/.
 /design-qa.md
 /site/
 .claude
 .agents/
+.zcode/
 .workbuddy/
 
 # LaTeX build artifacts
@@ -82,6 +82,9 @@ web/pnpm-workspace.yaml
 
 # Next.js build output
 .next/
+# Generated `prepare_web_package.py` payload; only the loader is source.
+/deeptutor_web/*
+!/deeptutor_web/__init__.py
 # Custom distDir builds (DEEPTUTOR_NEXT_DIST_DIR / parallel dev servers)
 web/.next-*/
 # PDF.js decoder files are copied from node_modules for local/dev and release
