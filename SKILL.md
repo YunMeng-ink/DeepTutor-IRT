@@ -86,7 +86,7 @@ deeptutor run math_animator "Visualize a Fourier series"
 
 `deeptutor chat` accepts the same `--session / --tool / --kb / --notebook-ref / --history-ref / --language / --config / --config-json` options, plus `--capability/-c <name>` to set the initial capability.
 
-**Tools** for `--tool` / `-t`: user-toggleable tools are `brainstorm`, `web_search`, `paper_search`, `reason`, `geogebra_analysis`, `imagegen`, and `videogen`. Context-gated tools (`rag`, `exec`, memory, notebook, …) mount according to context/capability rules; `--tool` does not bypass those rules. Mount a knowledge base with `--kb` for RAG. Run `deeptutor plugin list` for the registered set.
+**Tools** for `--tool` / `-t`: user-toggleable tools are `brainstorm`, `web_search`, `paper_search`, `zotero_search`, `reason`, `geogebra_analysis`, `imagegen`, and `videogen`. Context-gated tools (`rag`, `exec`, memory, notebook, …) mount according to context/capability rules; `--tool` does not bypass those rules. Mount a knowledge base with `--kb` for RAG. Run `deeptutor plugin list` for the registered set.
 
 ### Knowledge Bases
 

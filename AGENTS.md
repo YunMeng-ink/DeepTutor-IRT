@@ -40,7 +40,7 @@ ignored.
 
 ### Level 1 — Tools
 
-Single-function tools the LLM picks on demand. Seven user-toggleable tools
+Single-function tools the LLM picks on demand. Eight user-toggleable tools
 surface in `/settings/tools`:
 
 | Tool                 | Description                                   |
@@ -48,6 +48,7 @@ surface in `/settings/tools`:
 | `brainstorm`         | Breadth-first idea exploration with rationale |
 | `web_search`         | Web search with citations                     |
 | `paper_search`       | arXiv preprint search                         |
+| `zotero_search`      | Search the learner's Zotero library           |
 | `reason`             | Dedicated deep-reasoning LLM call             |
 | `geogebra_analysis`  | Analyze math images into GeoGebra commands    |
 | `imagegen`           | Generate images                               |
@@ -127,7 +128,7 @@ deeptutor start                   # backend + frontend together
 | `deeptutor/core/context.py`                | `UnifiedContext` dataclass            |
 | `deeptutor/tools/builtin/__init__.py`      | All built-in tool wrappers           |
 | `deeptutor/capabilities/`                  | Built-in capability implementations  |
-| `deeptutor/app.py`                         | `DeepTutorApp` — Python SDK facade    |
+| `deeptutor/app/facade.py`                  | `DeepTutorApp` — Python SDK facade    |
 | `deeptutor_cli/main.py`                    | Typer CLI entry point                |
 | `deeptutor/api/routers/unified_ws.py`      | Unified WebSocket endpoint           |
 
