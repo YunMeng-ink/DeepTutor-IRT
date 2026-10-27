@@ -20,6 +20,7 @@ simplest correct choice (no nested event loop).
 from __future__ import annotations
 
 from collections.abc import Callable
+import concurrent.futures
 from dataclasses import dataclass
 import io
 import json
@@ -27,6 +28,7 @@ import logging
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -47,6 +49,10 @@ DEFAULT_POLL_INTERVAL_SECONDS = 4.0
 DEFAULT_TIMEOUT_SECONDS = 300.0
 _SUBMIT_TIMEOUT_SECONDS = 60.0
 _UPLOAD_TIMEOUT_SECONDS = 300.0
+# Concurrent cloud jobs for one document's auto-split parts. Each part is an
+# independent batch; MinerU meters per account, so a handful is plenty to
+# overlap multi-minute polls without hammering the API.
+_MAX_PARALLEL_PARTS = 3
 _DOWNLOAD_TIMEOUT_SECONDS = 300.0
 
 _TERMINAL_OK = "done"
@@ -136,6 +142,80 @@ def parse_cloud(
 # ---------------------------------------------------------------------------
 
 
+def _fetch_part_archives(
+    parts: list["_PdfPart"],
+    *,
+    checkpoint_job: Path,
+    fetch: Callable[["_PdfPart", int, Callable[[str], None]], bytes],
+    on_part_ready: Callable[["_PdfPart", int, bytes, bool], None],
+    report: Callable[[str], None],
+) -> None:
+    """Fetch every part, handing each result to ``on_part_ready`` in page order.
+
+    Cached parts (a previous run completed them) are read inline and never
+    occupy a worker. Concurrency is bounded: MinerU meters per account, and the
+    win here is overlapping multi-minute polls, not saturating the API.
+
+    Results are delivered in page order even though fetches finish out of
+    order, so the caller can merge incrementally: a part that merges (and
+    validates) cleanly is persisted before the next one is even awaited, which
+    is what lets a retry skip it when a later part fails.
+    """
+    pending: list[tuple[int, "_PdfPart"]] = []
+    # Progress callbacks come from several workers at once; serialize them so
+    # the task log stream keeps whole lines.
+    report_lock = threading.Lock()
+
+    def emit(message: str) -> None:
+        with report_lock:
+            report(message)
+
+    ready: dict[int, tuple[bytes, bool]] = {}
+
+    total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        cached = SliceCheckpoint(checkpoint_job, part.start, part.end).load()
+        if cached is not None:
+            report(f"MinerU cloud: reusing completed part {index}/{total}")
+            ready[index] = (cached, True)
+        else:
+            pending.append((index, part))
+
+    def deliver_ready(upto: int) -> None:
+        for index in sorted(ready):
+            if index > upto:
+                break
+            archive, reused = ready.pop(index)
+            on_part_ready(parts[index - 1], index, archive, reused)
+
+    if not pending:
+        deliver_ready(total)
+        return
+
+    if len(pending) == 1:
+        index, part = pending[0]
+        report(f"MinerU cloud: parsing part {index}/{total} (pages {part.start + 1}-{part.end})")
+        ready[index] = (fetch(part, index, emit), False)
+    else:
+        active = min(_MAX_PARALLEL_PARTS, len(pending))
+        report(f"MinerU cloud: parsing {len(pending)} parts in parallel (max {active})")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=active) as pool:
+            futures = {index: pool.submit(fetch, part, index, emit) for index, part in pending}
+            try:
+                for index in range(1, total + 1):
+                    if index in futures:
+                        ready[index] = (futures[index].result(), False)
+                    deliver_ready(index)
+            except BaseException:
+                for future in futures.values():
+                    future.cancel()
+                raise
+        return
+
+    for index in range(1, total + 1):
+        deliver_ready(index)
+
+
 def _upload_and_fetch_archive(
     client: httpx.Client,
     part_path: Path,
@@ -145,14 +225,16 @@ def _upload_and_fetch_archive(
     report: Callable[[str], None],
     poll_interval: float,
     timeout: float,
+    part_label: str = "",
 ) -> bytes:
     """Run the upload → poll → download trio for one input file and return the
     result archive bytes. Shared by the single-file path and each slice of the
     auto-split path."""
-    report(f"MinerU cloud: requesting upload slot for {part_path.name}")
+    label = f"{part_label} " if part_label else ""
+    report(f"MinerU cloud: requesting upload slot for {label}{part_path.name}")
     batch_id, upload_url = _request_upload(client, part_path, config, key_pool)
     size_mb = part_path.stat().st_size / (1024 * 1024)
-    report(f"MinerU cloud: uploading {part_path.name} ({size_mb:.1f} MB)")
+    report(f"MinerU cloud: uploading {label}{part_path.name} ({size_mb:.1f} MB)")
     _upload_file(part_path, upload_url)
     zip_url = _poll_for_zip(
         client,
@@ -163,7 +245,9 @@ def _upload_and_fetch_archive(
         on_progress=report,
         key_pool=key_pool,
     )
-    report("MinerU cloud: downloading parsed result archive")
+    report(
+        f"MinerU cloud: downloading parsed result archive{(' for ' + label.strip()) if label else ''}"
+    )
     return _download(zip_url)
 
 
@@ -197,25 +281,11 @@ def _parse_pdf_in_parts(
             f"{config.max_pages_per_part}-page per-file limit; auto-splitting into "
             f"{total} part(s)"
         )
-        for index, part in enumerate(parts, start=1):
-            report(
-                f"MinerU cloud: parsing part {index}/{total} (pages {part.start + 1}-{part.end})"
-            )
-            checkpoint = SliceCheckpoint(checkpoint_job, part.start, part.end)
-            archive_bytes = checkpoint.load()
-            if archive_bytes is None:
-                archive_bytes = _upload_and_fetch_archive(
-                    client,
-                    part.path,
-                    config,
-                    key_pool,
-                    report=report,
-                    poll_interval=poll_interval,
-                    timeout=timeout,
-                )
-            else:
-                report(f"MinerU cloud: reusing completed part {index}/{total}")
+
+        def merge_part(part, index: int, archive_bytes: bytes, reused: bool) -> None:
+            nonlocal has_content_list
             report(f"MinerU cloud: merging part {index}/{total} artifacts")
+            checkpoint = SliceCheckpoint(checkpoint_job, part.start, part.end)
             with tempfile.TemporaryDirectory(prefix="mineru-part-") as part_tmp:
                 part_dir = Path(part_tmp) / "out"
                 part_dir.mkdir()
@@ -230,10 +300,34 @@ def _parse_pdf_in_parts(
                     page_count=part.end - part.start,
                 )
                 has_content_list = True
-                try:
-                    checkpoint.save(archive_bytes)
-                except OSError:
-                    logger.warning("Could not save MinerU slice checkpoint; parsing continues")
+                # Only after this part merged (and validated) do we mark it
+                # complete, so an invalid part can never be reused on retry.
+                if not reused:
+                    try:
+                        checkpoint.save(archive_bytes)
+                    except OSError:
+                        logger.warning("Could not save MinerU slice checkpoint; parsing continues")
+
+        # Each part is an independent cloud job (its own batch id and signed
+        # upload URL), so fetch them concurrently. Poll intervals dominate the
+        # wait — a 340-page book is two multi-minute jobs that used to run one
+        # after the other. Merging happens in page order as results arrive.
+        _fetch_part_archives(
+            parts,
+            checkpoint_job=checkpoint_job,
+            fetch=lambda part, index, emit: _upload_and_fetch_archive(
+                client,
+                part.path,
+                config,
+                key_pool,
+                report=emit,
+                poll_interval=poll_interval,
+                timeout=timeout,
+                part_label=f"part {index}/{total}",
+            ),
+            on_part_ready=merge_part,
+            report=report,
+        )
 
     merged_md = "".join(
         chunk if chunk.endswith("\n") else chunk + "\n" for chunk in markdown_chunks
@@ -421,11 +515,12 @@ def _upload_file(source_path: Path, upload_url: str) -> None:
 
     The signed URL carries its own auth; per MinerU's docs we must NOT send an
     ``Authorization`` or ``Content-Type`` header (a stray Content-Type breaks
-    the OSS signature).
+    the OSS signature). The body is streamed from the file handle so a large
+    part is never buffered whole in memory.
     """
-    data = source_path.read_bytes()
     try:
-        response = httpx.put(upload_url, content=data, timeout=_UPLOAD_TIMEOUT_SECONDS)
+        with source_path.open("rb") as handle:
+            response = httpx.put(upload_url, content=handle, timeout=_UPLOAD_TIMEOUT_SECONDS)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise MinerUError(f"Failed to upload file to MinerU: {exc}") from exc

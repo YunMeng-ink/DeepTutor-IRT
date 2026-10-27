@@ -70,7 +70,15 @@ def _install_fake_parse(
     calls: list[Path] = []
 
     def fake_upload_and_fetch(
-        client, part_path: Path, config, key_pool, *, report, poll_interval, timeout
+        client,
+        part_path: Path,
+        config,
+        key_pool,
+        *,
+        report,
+        poll_interval,
+        timeout,
+        part_label="",
     ) -> bytes:
         calls.append(part_path)
         if record is not None:
@@ -315,9 +323,17 @@ def test_retry_reuses_completed_slice_after_output_cleanup(tmp_path, monkeypatch
     with pytest.raises(MinerUError, match="interruption"):
         mineru_cloud.parse_cloud(pdf, tmp_path / "out", config)
     shutil.rmtree(tmp_path / "out")  # ParseService removes failed work directories
+
+    calls.clear()
     fail = False
     out = mineru_cloud.parse_cloud(pdf, tmp_path / "out", config)
-    assert calls == ["retry_part01.pdf", "retry_part02.pdf", "retry_part02.pdf", "retry_part03.pdf"]
+
+    # Parts are fetched concurrently, so the aborted run may already have
+    # finished part 3; what matters is that a completed slice is never
+    # re-parsed and the failed one is.
+    assert "retry_part01.pdf" not in calls
+    assert "retry_part02.pdf" in calls
+    assert set(calls) <= {"retry_part02.pdf", "retry_part03.pdf"}
     assert [
         row["page_idx"] for row in json.loads((out / "retry_content_list.json").read_text())
     ] == [0, 2, 4]
@@ -406,3 +422,61 @@ def test_invalid_checkpoint_pointer_is_a_miss(tmp_path, pointer):
     checkpoint.directory.mkdir()
     checkpoint.pointer.write_text(pointer)
     assert checkpoint.load() is None
+
+
+def test_parts_are_fetched_concurrently_but_merged_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: list | None = None
+) -> None:
+    """A 340-page book is two multi-minute cloud jobs; they must overlap.
+
+    Merging stays ordered: part N's text always lands after part N-1's.
+    """
+    import time
+
+    pdf = _make_pdf(tmp_path / "big.pdf", 250)
+    started: list[float] = []
+    finished: list[float] = []
+
+    def fake_upload_and_fetch(
+        client, part_path: Path, config, key_pool, *, report, poll_interval, timeout, part_label=""
+    ) -> bytes:
+        started.append(time.monotonic())
+        time.sleep(0.2)
+        finished.append(time.monotonic())
+        return _fake_archive_bytes(part_path.stem, f"# {part_path.stem}")
+
+    monkeypatch.setattr(mineru_cloud, "_upload_and_fetch_archive", fake_upload_and_fetch)
+
+    begin = time.monotonic()
+    working_dir = mineru_cloud.parse_cloud(pdf, tmp_path / "out", CLOUD_CFG)
+    elapsed = time.monotonic() - begin
+
+    assert len(started) == 2
+    # Overlapped: the second part starts before the first finishes.
+    assert started[1] < finished[0]
+    # Serial would be >= 0.4s.
+    assert elapsed < 0.35
+    text = (working_dir / "big.md").read_text(encoding="utf-8")
+    assert text.index("big_part01") < text.index("big_part02")
+
+
+def test_completed_parts_are_reused_without_touching_the_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.parsing.engines.mineru import checkpoints
+
+    pdf = _make_pdf(tmp_path / "big.pdf", 250)
+    first_calls = _install_fake_parse(monkeypatch, md_for=lambda part: f"# {part.stem}")
+    mineru_cloud.parse_cloud(pdf, tmp_path / "out", CLOUD_CFG)
+    assert len(first_calls) == 2
+
+    # Second run: every part is in the slice checkpoint already.
+    second_calls = _install_fake_parse(monkeypatch)
+    progress: list[str] = []
+    working_dir = mineru_cloud.parse_cloud(
+        pdf, tmp_path / "out2", CLOUD_CFG, on_progress=progress.append
+    )
+
+    assert second_calls == []
+    assert any("reusing completed part" in message for message in progress)
+    assert (working_dir / "big.md").read_text(encoding="utf-8").count("big_part") == 2
