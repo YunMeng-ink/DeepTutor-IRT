@@ -867,6 +867,58 @@ class OpenAICompatProvider(LLMProvider):
             reasoning_content=reasoning_content,
         )
 
+    @staticmethod
+    def _accumulate_final_tool_call(
+        tc_bufs: dict[int, dict[str, Any]],
+        tc: Any,
+        idx_hint: int = 0,
+    ) -> None:
+        """Fold one streamed tool-call delta into the final response buffer."""
+        tc_index: int = _get(tc, "index") if _get(tc, "index") is not None else idx_hint
+        buf = tc_bufs.setdefault(
+            tc_index,
+            {
+                "id": "",
+                "name": "",
+                "arguments": "",
+            },
+        )
+        tc_id = _get(tc, "id")
+        if tc_id:
+            buf["id"] = str(tc_id)
+        fn = _get(tc, "function")
+        if fn is not None:
+            fn_name = _get(fn, "name")
+            if fn_name:
+                buf["name"] = str(fn_name)
+            fn_args = _get(fn, "arguments")
+            if fn_args:
+                buf["arguments"] += str(fn_args)
+
+    @staticmethod
+    def _build_streamed_response(
+        *,
+        content_parts: list[str],
+        reasoning_parts: list[str],
+        tc_bufs: dict[int, dict[str, Any]],
+        finish_reason: str,
+        usage: dict[str, int],
+    ) -> LLMResponse:
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            tool_calls=[
+                ToolCallRequest(
+                    id=b["id"] or _short_tool_id(),
+                    name=b["name"],
+                    arguments=json_repair.loads(b["arguments"]) if b["arguments"] else {},
+                )
+                for b in tc_bufs.values()
+            ],
+            finish_reason=finish_reason,
+            usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
+        )
+
     @classmethod
     def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
@@ -874,28 +926,6 @@ class OpenAICompatProvider(LLMProvider):
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
-
-        def _accum_tc(tc: Any, idx_hint: int) -> None:
-            tc_index: int = _get(tc, "index") if _get(tc, "index") is not None else idx_hint
-            buf = tc_bufs.setdefault(
-                tc_index,
-                {
-                    "id": "",
-                    "name": "",
-                    "arguments": "",
-                },
-            )
-            tc_id = _get(tc, "id")
-            if tc_id:
-                buf["id"] = str(tc_id)
-            fn = _get(tc, "function")
-            if fn is not None:
-                fn_name = _get(fn, "name")
-                if fn_name:
-                    buf["name"] = str(fn_name)
-                fn_args = _get(fn, "arguments")
-                if fn_args:
-                    buf["arguments"] += str(fn_args)
 
         for chunk in chunks:
             if isinstance(chunk, str):
@@ -929,24 +959,14 @@ class OpenAICompatProvider(LLMProvider):
                 if reasoning:
                     reasoning_parts.append(reasoning)
             for tc in (delta.tool_calls or []) if delta else []:
-                _accum_tc(tc, getattr(tc, "index", 0))
+                cls._accumulate_final_tool_call(tc_bufs, tc, getattr(tc, "index", 0))
 
-        content = "".join(content_parts) or None
-        reasoning_content = "".join(reasoning_parts) or None
-
-        return LLMResponse(
-            content=content,
-            tool_calls=[
-                ToolCallRequest(
-                    id=b["id"] or _short_tool_id(),
-                    name=b["name"],
-                    arguments=json_repair.loads(b["arguments"]) if b["arguments"] else {},
-                )
-                for b in tc_bufs.values()
-            ],
+        return cls._build_streamed_response(
+            content_parts=content_parts,
+            reasoning_parts=reasoning_parts,
+            tc_bufs=tc_bufs,
             finish_reason=finish_reason,
             usage=usage,
-            reasoning_content=reasoning_content,
         )
 
     @staticmethod
@@ -1212,11 +1232,18 @@ class OpenAICompatProvider(LLMProvider):
                 else:
                     raise
 
-            chunks: list[Any] = []
             stream_iter = stream.__aiter__()
-            # Mirrors the accumulation ``_parse_chunks`` does after the fact,
-            # but live, so ``on_tool_args_delta`` can report a call while it is
-            # still being written. The authoritative parse stays below.
+            # Accumulate the fields the final response is built from while the
+            # stream runs, instead of retaining every SDK chunk and re-walking
+            # them afterwards. A long answer produces thousands of chunk
+            # objects; only these small values survive the loop now.
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            final_tc_bufs: dict[int, dict[str, Any]] = {}
+            finish_reason = "stop"
+            usage: dict[str, int] = {}
+            # Mirrors the same accumulation, live, so ``on_tool_args_delta``
+            # can report a call while it is still being written.
             streaming_tool_args: dict[int, dict[str, str]] = {}
             while True:
                 try:
@@ -1226,29 +1253,57 @@ class OpenAICompatProvider(LLMProvider):
                     )
                 except StopAsyncIteration:
                     break
-                chunks.append(chunk)
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if on_reasoning_delta and delta is not None:
-                        reasoning_text = getattr(delta, "reasoning_content", None) or getattr(
-                            delta, "reasoning", None
-                        )
-                        if reasoning_text:
-                            await on_reasoning_delta(reasoning_text)
-                    if on_content_delta and delta is not None:
-                        text = getattr(delta, "content", None)
-                        if text:
-                            await on_content_delta(text)
-                    if on_tool_args_delta and delta is not None:
-                        for tc in getattr(delta, "tool_calls", None) or []:
-                            buffered = _accumulate_streamed_tool_call(streaming_tool_args, tc)
-                            if buffered is not None and buffered["name"]:
-                                await on_tool_args_delta(
-                                    buffered["id"],
-                                    buffered["name"],
-                                    buffered["arguments"],
-                                )
-            return self._parse_chunks(chunks)
+                if isinstance(chunk, str):
+                    content_parts.append(chunk)
+                    if on_content_delta:
+                        await on_content_delta(chunk)
+                    continue
+                if not getattr(chunk, "choices", None):
+                    usage = self._extract_usage(chunk) or usage
+                    continue
+                # Some providers attach usage to the chunk carrying the last
+                # delta; only a report with real numbers replaces what we have.
+                delta_usage = self._extract_usage(chunk)
+                if delta_usage and any(
+                    delta_usage.get(key)
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                ):
+                    usage = delta_usage
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                delta = choice.delta
+                if delta is None:
+                    continue
+                reasoning_text = getattr(delta, "reasoning_content", None) or getattr(
+                    delta, "reasoning", None
+                )
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
+                    if on_reasoning_delta:
+                        await on_reasoning_delta(reasoning_text)
+                text = getattr(delta, "content", None)
+                if text:
+                    content_parts.append(text)
+                    if on_content_delta:
+                        await on_content_delta(text)
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    self._accumulate_final_tool_call(final_tc_bufs, tc, getattr(tc, "index", 0))
+                    if on_tool_args_delta:
+                        buffered = _accumulate_streamed_tool_call(streaming_tool_args, tc)
+                        if buffered is not None and buffered["name"]:
+                            await on_tool_args_delta(
+                                buffered["id"],
+                                buffered["name"],
+                                buffered["arguments"],
+                            )
+            return self._build_streamed_response(
+                content_parts=content_parts,
+                reasoning_parts=reasoning_parts,
+                tc_bufs=final_tc_bufs,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=f"Error calling LLM: stream stalled for more than {idle_timeout_s} seconds",
