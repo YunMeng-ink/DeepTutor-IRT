@@ -2890,6 +2890,45 @@ class SQLiteSessionStore:
     async def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         return await self._run(self._get_messages_sync, session_id)
 
+    async def count_user_turns(self, session_id: str, leaf_message_id: int | None = None) -> int:
+        """Count user messages on the active branch without loading history.
+
+        Callers use this to number the turn they are about to run
+        (``first_seen_turn``). The generic protocol path loads every message
+        and walks the parent chain; a recursive CTE answers the same question
+        from the index, which matters because this runs before the first token.
+        """
+        return await self._run(self._count_user_turns_sync, session_id, leaf_message_id)
+
+    def _count_user_turns_sync(self, session_id: str, leaf_message_id: int | None) -> int:
+        with self._connect() as conn:
+            if leaf_message_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS total FROM messages WHERE session_id = ? AND role = 'user'",
+                    (session_id,),
+                ).fetchone()
+                return int(row["total"])
+
+            # ``depth`` bounds the walk so a corrupted parent pointer cannot
+            # spin forever; it mirrors the Python fallback's safety counter.
+            row = conn.execute(
+                """
+                WITH RECURSIVE chain(id, parent_message_id, role, depth) AS (
+                    SELECT id, parent_message_id, role, 0
+                    FROM messages
+                    WHERE id = ? AND session_id = ?
+                    UNION ALL
+                    SELECT m.id, m.parent_message_id, m.role, chain.depth + 1
+                    FROM messages AS m
+                    JOIN chain ON m.id = chain.parent_message_id
+                    WHERE m.session_id = ? AND chain.depth < 10000
+                )
+                SELECT COUNT(*) AS total FROM chain WHERE role = 'user'
+                """,
+                (int(leaf_message_id), session_id, session_id),
+            ).fetchone()
+            return int(row["total"])
+
     def _get_messages_for_context_sync(
         self, session_id: str, leaf_message_id: int | None = None
     ) -> list[dict[str, Any]]:

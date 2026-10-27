@@ -1041,9 +1041,14 @@ async def _count_branch_user_turns(
     ``leaf_message_id`` is ``None`` (legacy linear append) all messages
     in the session are counted; otherwise we walk the
     ``parent_message_id`` chain so sibling branches don't inflate the
-    count. Kept tiny and protocol-only (``get_messages``) so it stays
-    compatible with every store backend.
+    count. A backend that can answer this without materializing history
+    exposes ``count_user_turns`` and is preferred; the generic
+    ``get_messages`` walk below stays as the protocol-only fallback.
     """
+    counter = getattr(store, "count_user_turns", None)
+    if callable(counter):
+        return int(await counter(session_id, leaf_message_id))
+
     all_msgs = await store.get_messages(session_id)
     if leaf_message_id is None:
         return sum(1 for m in all_msgs if m.get("role") == "user")

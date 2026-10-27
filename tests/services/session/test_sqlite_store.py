@@ -1365,3 +1365,35 @@ def test_appending_events_moves_the_preview_to_a_new_cache_entry(tmp_path: Path)
 
     assert before_seq == 1
     assert after_seq == 2
+
+
+def test_count_user_turns_matches_the_parent_chain_walk(tmp_path: Path) -> None:
+    """The store-side count must agree with the generic history walk,
+    including on a branched session."""
+    store = SQLiteSessionStore(tmp_path / "store.db")
+
+    async def _main() -> tuple[int, int, int]:
+        session = await store.create_session("branchy")
+        first_user_id = await store.add_message(session["id"], "user", "q1")
+        first_answer_id = await store.add_message(session["id"], "assistant", "a1")
+        second_user_id = await store.add_message(session["id"], "user", "q2")
+        # A sibling branch off the first answer: excluded from the active chain.
+        await store.add_message(
+            session["id"],
+            "user",
+            "q2-alt",
+            parent_message_id=first_answer_id,
+        )
+        await store.add_message(session["id"], "assistant", "a2")
+
+        return (
+            await store.count_user_turns(session["id"]),
+            await store.count_user_turns(session["id"], second_user_id),
+            await store.count_user_turns(session["id"], first_user_id),
+        )
+
+    all_user, on_chain, first_only = asyncio.run(_main())
+
+    assert all_user == 3  # q1, q2, q2-alt
+    assert on_chain == 2  # q1, q2
+    assert first_only == 1
