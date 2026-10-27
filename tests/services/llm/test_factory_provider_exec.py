@@ -169,7 +169,7 @@ async def test_complete_with_config_never_resolves_or_merges_global_config(monke
     def _unexpected_resolver(**_kwargs: Any):
         raise AssertionError("explicit config path must not resolve global config")
 
-    def _fake_build_isolated_provider(config: LLMConfig):
+    def _fake_get_isolated_provider(config: LLMConfig):
         captured_config["config"] = config
         return provider
 
@@ -177,15 +177,16 @@ async def test_complete_with_config_never_resolves_or_merges_global_config(monke
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", _unexpected_resolver)
     monkeypatch.setattr("deeptutor.services.llm.factory._resolve_provider_spec", lambda **_: None)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.build_isolated_provider",
-        _fake_build_isolated_provider,
+        "deeptutor.services.llm.factory.get_isolated_provider",
+        _fake_get_isolated_provider,
     )
 
     assert await complete_with_config(snapshot, "hello") == "ok"
     assert captured_config["config"] is snapshot
     assert captured_config["config"].extra_headers == {}
     assert provider.complete_kwargs["reasoning_effort"] is None
-    assert provider.closed == 1
+    # The provider is pooled per config now; the call must not close it.
+    assert provider.closed == 0
 
 
 @pytest.mark.asyncio
@@ -406,3 +407,29 @@ async def test_stream_keeps_delivered_output_when_provider_reports_error_late(
         chunks.append(chunk)
 
     assert chunks == ["Hello"]
+
+
+def test_retry_schedule_stays_within_the_wait_budget() -> None:
+    """Configured attempts are a ceiling; the cumulative wait is budgeted.
+
+    With the shipped defaults (8 attempts, 5 s base, exponential) the sleeps
+    alone summed to ~515 s, so one flaky gateway could hold a turn open for
+    minutes before surfacing an error.
+    """
+    from deeptutor.services.llm.factory import (
+        _MAX_TOTAL_RETRY_DELAY_SECONDS,
+        _build_retry_delays,
+    )
+
+    delays = _build_retry_delays(8, 5.0, True)
+
+    assert delays == (5.0, 10.0, 20.0, 40.0, 80.0)
+    assert sum(delays) <= _MAX_TOTAL_RETRY_DELAY_SECONDS
+
+
+def test_small_retry_configs_are_unchanged() -> None:
+    from deeptutor.services.llm.factory import _build_retry_delays
+
+    assert _build_retry_delays(3, 0.5, True) == (0.5, 1.0, 2.0)
+    assert _build_retry_delays(4, 2.0, False) == (2.0, 2.0, 2.0, 2.0)
+    assert _build_retry_delays(0, 5.0, True) == ()

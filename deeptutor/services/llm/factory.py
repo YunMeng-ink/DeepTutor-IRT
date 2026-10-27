@@ -24,7 +24,7 @@ from .config import LLMConfig, get_llm_config
 from .error_mapping import map_error
 from .multimodal import prepare_multimodal_messages
 from .provider_core.base import LLMProvider
-from .provider_factory import build_isolated_provider, get_runtime_provider
+from .provider_factory import get_isolated_provider, get_runtime_provider
 from .types import StreamOutcome
 from .utils import is_local_llm_server
 
@@ -34,6 +34,12 @@ DEFAULT_EXPONENTIAL_BACKOFF = settings.retry.exponential_backoff
 DEFAULT_STREAM_COALESCE_CHARS = 64
 DEFAULT_STREAM_COALESCE_SECONDS = 0.04
 STREAM_CONTROL_TOKENS = {"<think>", "</think>"}
+
+# Ceilings for the retry schedule: no single wait above two minutes, and no
+# more than three minutes of cumulative waiting per call. Configured attempt
+# counts still apply when they are smaller.
+_MAX_SINGLE_RETRY_DELAY_SECONDS = 120.0
+_MAX_TOTAL_RETRY_DELAY_SECONDS = 180.0
 
 CallKwargs = dict[str, Any]
 
@@ -72,9 +78,18 @@ def _build_retry_delays(
         return ()
     delays: list[float] = []
     base = max(float(retry_delay), 0.0)
+    total = 0.0
     for attempt in range(max_retries):
         delay = base * (2**attempt) if exponential_backoff else base
-        delays.append(min(delay, 120.0))
+        delay = min(delay, _MAX_SINGLE_RETRY_DELAY_SECONDS)
+        # The configured attempt count is a ceiling, not a promise. With the
+        # defaults (8 attempts, 5 s base, exponential backoff) the sleeps alone
+        # summed to ~515 s, so one flaky gateway could hold an interactive turn
+        # open for minutes. Stop scheduling once that wait budget is spent.
+        if total + delay > _MAX_TOTAL_RETRY_DELAY_SECONDS:
+            break
+        delays.append(delay)
+        total += delay
     return tuple(delays)
 
 
@@ -494,26 +509,26 @@ async def complete_with_config(
         base_url=config.effective_url or config.base_url,
         fallback=config.provider_name or config.binding,
     )
-    provider = build_isolated_provider(config)
-    try:
-        return await _complete_with_resolved_config(
-            config,
-            provider_spec,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            messages=messages,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            exponential_backoff=exponential_backoff,
-            allow_image_fallback=allow_image_fallback,
-            image_data=image_data,
-            image_mime_type=str(image_mime_type or "image/png"),
-            image_filename=str(image_filename or "image.png"),
-            kwargs=kwargs,
-            provider=provider,
-        )
-    finally:
-        await provider.aclose()
+    # Pooled per (config, loop): this path serves vision captions, RAG role
+    # calls and probes, and building+closing an SDK client per call paid a
+    # fresh TCP+TLS handshake each time. The provider is still env-isolated.
+    provider = get_isolated_provider(config)
+    return await _complete_with_resolved_config(
+        config,
+        provider_spec,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        messages=messages,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        exponential_backoff=exponential_backoff,
+        allow_image_fallback=allow_image_fallback,
+        image_data=image_data,
+        image_mime_type=str(image_mime_type or "image/png"),
+        image_filename=str(image_filename or "image.png"),
+        kwargs=kwargs,
+        provider=provider,
+    )
 
 
 async def stream(

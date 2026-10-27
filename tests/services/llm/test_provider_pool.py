@@ -143,3 +143,58 @@ async def test_copilot_pool_separates_owners_and_runtime_homes(tmp_path, monkeyp
     assert admin is provider_factory.get_runtime_provider(config)
     monkeypatch.setenv("DEEPTUTOR_HOME", str(tmp_path / "home-two"))
     assert provider_factory.get_runtime_provider(config) is not admin
+
+
+@pytest.mark.asyncio
+async def test_isolated_provider_is_pooled_per_config(monkeypatch) -> None:
+    """Explicit-config calls (RAG roles, vision captions, probes) used to build
+    and close a client per call, paying a fresh TLS handshake each time."""
+    built: list[_FakeProvider] = []
+    env_flags: list[bool] = []
+
+    def _build(_config: LLMConfig, *, configure_env: bool = True) -> _FakeProvider:
+        env_flags.append(configure_env)
+        provider = _FakeProvider()
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr(provider_factory, "_build_runtime_provider", _build)
+
+    first = provider_factory.get_isolated_provider(_config())
+    second = provider_factory.get_isolated_provider(_config())
+    other = provider_factory.get_isolated_provider(_config(model="another-model"))
+
+    assert first is second
+    assert other is not first
+    assert len(built) == 2
+    # Isolation is about never mutating process-global provider env.
+    assert env_flags == [False, False]
+    assert first.closed == 0
+
+
+@pytest.mark.asyncio
+async def test_isolated_pool_is_bounded_and_closed_on_reset(monkeypatch) -> None:
+    import asyncio
+
+    built: list[_FakeProvider] = []
+
+    def _build(_config: LLMConfig, *, configure_env: bool = True) -> _FakeProvider:
+        provider = _FakeProvider()
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr(provider_factory, "_build_runtime_provider", _build)
+
+    for index in range(provider_factory._ISOLATED_PROVIDER_POOL_MAXSIZE + 1):
+        provider_factory.get_isolated_provider(_config(model=f"model-{index}"))
+
+    await asyncio.sleep(0)
+    assert (
+        len(provider_factory._isolated_provider_pool)
+        == provider_factory._ISOLATED_PROVIDER_POOL_MAXSIZE
+    )
+    assert built[0].closed == 1
+
+    provider_factory.reset_runtime_provider_pool()
+    await asyncio.sleep(0)
+    assert provider_factory._isolated_provider_pool == {}

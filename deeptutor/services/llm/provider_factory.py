@@ -18,6 +18,13 @@ _PROVIDER_POOL_MAXSIZE = 2
 _provider_pool: "OrderedDict[tuple[Any, ...], LLMProvider]" = OrderedDict()
 _provider_pool_lock = threading.RLock()
 
+# Separately pooled: env-isolated providers serve explicit configs (RAG roles,
+# vision captions, probes). They are built without touching process-global
+# provider env, so caching them keeps the isolation guarantee while reusing
+# their SDK connection pool across calls.
+_ISOLATED_PROVIDER_POOL_MAXSIZE = 4
+_isolated_provider_pool: "OrderedDict[tuple[Any, ...], LLMProvider]" = OrderedDict()
+
 
 def _secret_fingerprint(value: str | list[str] | None) -> str:
     if not value:
@@ -140,6 +147,32 @@ def build_isolated_provider(config: LLMConfig) -> LLMProvider:
     return _build_runtime_provider(config, configure_env=False)
 
 
+def get_isolated_provider(config: LLMConfig) -> LLMProvider:
+    """Return a pooled, env-isolated provider for an explicit config.
+
+    ``complete_with_config`` used to build and close a provider per call, so
+    every vision caption, RAG-role call and probe request paid a fresh
+    TCP+TLS handshake and a new SDK client. Isolation here means "never
+    touches process-global provider env", not "short-lived"; the pool keeps
+    that guarantee and adds keep-alive.
+    """
+    loop = asyncio.get_running_loop()
+    key = _provider_cache_key(config, loop)
+    with _provider_pool_lock:
+        cached = _isolated_provider_pool.get(key)
+        if cached is not None:
+            _isolated_provider_pool.move_to_end(key)
+            return cached
+
+        provider = _build_runtime_provider(config, configure_env=False)
+        _isolated_provider_pool[key] = provider
+        _isolated_provider_pool.move_to_end(key)
+        while len(_isolated_provider_pool) > _ISOLATED_PROVIDER_POOL_MAXSIZE:
+            _, evicted = _isolated_provider_pool.popitem(last=False)
+            _schedule_close(evicted, loop)
+        return provider
+
+
 def _schedule_close(provider: LLMProvider, loop: asyncio.AbstractEventLoop) -> None:
     async def _close() -> None:
         with contextlib.suppress(Exception):
@@ -180,8 +213,9 @@ def get_runtime_provider(config: LLMConfig | None = None) -> LLMProvider:
 async def close_runtime_provider_pool() -> None:
     """Close every pooled SDK client during shutdown or config reload."""
     with _provider_pool_lock:
-        providers = list(_provider_pool.values())
+        providers = list(_provider_pool.values()) + list(_isolated_provider_pool.values())
         _provider_pool.clear()
+        _isolated_provider_pool.clear()
     if providers:
         await asyncio.gather(*(provider.aclose() for provider in providers), return_exceptions=True)
 
@@ -189,8 +223,9 @@ async def close_runtime_provider_pool() -> None:
 def reset_runtime_provider_pool() -> None:
     """Clear the pool from synchronous cache-invalidation call sites."""
     with _provider_pool_lock:
-        providers = list(_provider_pool.values())
+        providers = list(_provider_pool.values()) + list(_isolated_provider_pool.values())
         _provider_pool.clear()
+        _isolated_provider_pool.clear()
     if not providers:
         return
     try:
@@ -213,6 +248,7 @@ def runtime_provider_pool_size() -> int:
 __all__ = [
     "build_isolated_provider",
     "close_runtime_provider_pool",
+    "get_isolated_provider",
     "get_runtime_provider",
     "reset_runtime_provider_pool",
     "runtime_provider_pool_size",
