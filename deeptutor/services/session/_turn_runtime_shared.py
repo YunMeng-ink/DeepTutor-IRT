@@ -1593,7 +1593,10 @@ class _TurnExecution:
     flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     flush_task: asyncio.Task[None] | None = None
     events_persisted: bool = False
-    persisted_events: list[dict[str, Any]] = field(default_factory=list)
+    # Number of leading ``events`` entries already durable. A count, not a
+    # second list: keeping a parallel list made every flush copy the whole
+    # prefix (quadratic over a long turn's token events).
+    persisted_count: int = 0
     events_flushed: bool = False
     lease: TurnLease | None = None
     coordination_task: asyncio.Task[None] | None = None

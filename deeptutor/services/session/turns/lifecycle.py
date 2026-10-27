@@ -688,7 +688,7 @@ class TurnLifecycle:
                 execution.events.append(payload)
             subscribers = list(current.subscribers)
         if event.type == StreamEventType.DONE or (
-            len(execution.events) - len(execution.persisted_events) >= 25
+            len(execution.events) - execution.persisted_count >= 25
         ):
             # Never expose DONE to a process-local subscriber before the
             # complete event prefix is durable. Redis subscribers already
@@ -716,7 +716,7 @@ class TurnLifecycle:
                 logger.exception("Live event persistence failed for turn %s", execution.turn_id)
                 delay = min(delay * 2, 5.0)
                 continue
-            if len(execution.persisted_events) == len(execution.events):
+            if execution.persisted_count == len(execution.events):
                 return
             delay = 0.25
 
@@ -728,11 +728,13 @@ class TurnLifecycle:
     async def _flush_buffered_events_once(self, execution: _TurnExecution) -> None:
         """One serialized persistence attempt for :meth:`_flush_buffered_events`."""
         async with self._lock:
-            events = list(execution.events)
-        persisted_events = list(execution.persisted_events)
-        pending = events[len(persisted_events) :]
+            events_len = len(execution.events)
+            persisted_count = execution.persisted_count
+            # Only the unpersisted suffix is copied; the durable prefix is
+            # represented by its length, not by a parallel list.
+            pending = execution.events[persisted_count:]
         if not pending:
-            execution.events_persisted = len(persisted_events) == len(events)
+            execution.events_persisted = persisted_count == events_len
             execution.events_flushed = True
             return
 
@@ -756,19 +758,20 @@ class TurnLifecycle:
                     len(pending),
                     execution.turn_id,
                 )
-                execution.persisted_events = persisted_events
+                execution.persisted_count = events_len
                 execution.events_persisted = True
                 execution.events_flushed = True
                 return
-            execution.persisted_events = persisted_events + list(persisted_batch)
-            execution.events_persisted = len(execution.persisted_events) == len(events)
+            execution.persisted_count = persisted_count + len(persisted_batch)
+            execution.events_persisted = execution.persisted_count == events_len
             execution.events_flushed = True
             return
 
+        count = persisted_count
         try:
             for index, payload in enumerate(pending):
                 try:
-                    persisted = await self.store.append_turn_event(execution.turn_id, payload)
+                    await self.store.append_turn_event(execution.turn_id, payload)
                 except ValueError as exc:
                     # A turn can disappear when the session is deleted while the turn
                     # task is draining post-stream persistence. Avoid cascading
@@ -783,13 +786,14 @@ class TurnLifecycle:
                         execution.turn_id,
                         payload.get("type", ""),
                     )
+                    count = events_len
                     break
-                persisted_events.append(persisted)
+                count += 1
         except Exception:
             # Cache a committed prefix so retries continue after it instead of
             # duplicating already persisted events on non-batching backends.
-            execution.persisted_events = persisted_events
+            execution.persisted_count = count
             raise
-        execution.persisted_events = persisted_events
-        execution.events_persisted = len(persisted_events) == len(events)
+        execution.persisted_count = count
+        execution.events_persisted = count == events_len
         execution.events_flushed = True
