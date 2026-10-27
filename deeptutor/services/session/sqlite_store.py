@@ -254,12 +254,23 @@ class QuestionBankQuery:
 class SQLiteSessionStore:
     """Persist unified chat sessions and messages in a SQLite database."""
 
+    # Upper bound on concurrent database operations. Every operation runs in a
+    # worker thread with its own connection; this cap keeps thread/connection
+    # churn bounded without serializing unrelated sessions.
+    _MAX_CONCURRENT_DB_OPS = 8
+
     def __init__(self, db_path: Path | None = None) -> None:
         path_service = get_path_service()
         self.db_path = db_path or path_service.get_chat_history_db()
         ensure_private_directory(self.db_path.parent)
         self._migrate_legacy_db(path_service)
-        self._lock = asyncio.Lock()
+        # Read/write concurrency: each operation opens its own connection and
+        # the database runs in WAL mode, so SQLite already lets readers work
+        # beside the single writer and `busy_timeout` absorbs write contention.
+        # The previous process-wide asyncio.Lock serialized every read too, so
+        # one slow write (an event flush, a subscriber poll) stalled unrelated
+        # sessions. A bounded slot count caps parallel connections instead.
+        self._op_slots = asyncio.Semaphore(self._MAX_CONCURRENT_DB_OPS)
         with _migration_lock(self.db_path):
             self._initialize()
         ensure_private_file(self.db_path)
@@ -1117,7 +1128,7 @@ class SQLiteSessionStore:
         )
 
     async def _run(self, fn, *args):
-        async with self._lock:
+        async with self._op_slots:
             return await asyncio.to_thread(fn, *args)
 
     @contextmanager

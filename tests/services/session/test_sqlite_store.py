@@ -1258,3 +1258,52 @@ def test_branch_context_messages_carry_private_metadata(store: SQLiteSessionStor
     messages = asyncio.run(store.get_messages_for_context(session["id"], leaf_message_id=leaf))
 
     assert messages[-1]["metadata"]["provider_response_state"] == state
+
+
+def test_store_operations_overlap_instead_of_serializing(tmp_path: Path) -> None:
+    """Two independent operations must not queue behind one another.
+
+    A process-wide lock used to serialize every read and write, so a slow
+    write stalled unrelated sessions (and subscriber polls).
+    """
+    import time
+
+    store = SQLiteSessionStore(tmp_path / "store.db")
+
+    def _slow(_value: int) -> int:
+        time.sleep(0.15)
+        return _value
+
+    async def _main() -> float:
+        start = time.monotonic()
+        await asyncio.gather(
+            store._run(_slow, 1),
+            store._run(_slow, 2),
+            store._run(_slow, 3),
+        )
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(_main())
+    # Serial would be >= 0.45s; three slots in parallel is about 0.15s.
+    assert elapsed < 0.35
+
+
+def test_concurrency_slots_are_released_after_failure(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path / "store.db")
+
+    def _boom() -> None:
+        raise RuntimeError("operation failed")
+
+    async def _main() -> None:
+        with pytest.raises(RuntimeError, match="operation failed"):
+            await store._run(_boom)
+        # The slot must be back: a full complement of operations still runs.
+        results = await asyncio.gather(
+            *(
+                store._run(lambda index=index: index)
+                for index in range(store._MAX_CONCURRENT_DB_OPS)
+            )
+        )
+        assert sorted(results) == list(range(store._MAX_CONCURRENT_DB_OPS))
+
+    asyncio.run(_main())
