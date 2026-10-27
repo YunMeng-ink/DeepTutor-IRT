@@ -175,22 +175,156 @@ def bench_answer_assembly() -> None:
 
 
 def bench_token_count() -> None:
-    from deeptutor.services.session.context_builder import count_tokens
+    from deeptutor.services.session.context_builder import count_tokens, reset_token_count_cache
 
     text = ("A router forwards packets between networks. " * 2000)[:80000]
     try:
+        # Loading tiktoken's BPE table is a one-time process cost (~100 ms);
+        # keep it out of the per-call numbers.
+        count_tokens("warm up the tokenizer")
+        reset_token_count_cache()
         samples = []
         for _ in range(20):
             start = time.perf_counter()
             count_tokens(text)
             samples.append(time.perf_counter() - start)
-        _report("count_tokens on 80KB text", samples)
+        _report("count_tokens on 80KB text, cold", [samples[0]])
+        _report("count_tokens on 80KB text, memoized", samples[1:])
     except Exception as exc:  # tokenizer may be unavailable offline
         print(f"count_tokens skipped: {exc}")
+    finally:
+        reset_token_count_cache()
+
+
+def bench_token_cache() -> None:
+    from deeptutor.services.session.context_builder import (
+        count_tokens,
+        reset_token_count_cache,
+    )
+
+    text = ("A router forwards packets between networks. " * 2000)[:80000]
+    reset_token_count_cache()
+    count_tokens(text)  # warm
+
+    samples = []
+    for _ in range(50):
+        start = time.perf_counter()
+        count_tokens(text)
+        samples.append(time.perf_counter() - start)
+    _report("count_tokens 80KB (memoized)", samples)
+
+
+def bench_turn_preview_cache() -> None:
+    import asyncio
+    import tempfile
+
+    from deeptutor.services.session.sqlite_store import SQLiteSessionStore
+
+    async def run(tmp: str) -> tuple[float, float]:
+        store = SQLiteSessionStore(Path(tmp) / "sessions.db")
+        session = await store.create_session("bench")
+        turn = await store.create_turn(session["id"], capability="chat")
+        events = [{"type": "content", "content": "x" * 200, "seq": seq} for seq in range(1, 401)]
+        events.append({"type": "done", "content": "done", "seq": 401})
+        await store.append_events(turn["id"], events)
+
+        with store._connect() as conn:
+
+            def measure() -> float:
+                start = time.perf_counter()
+                store._canonical_trace_preview_sync(conn, turn["id"], session["id"])
+                return time.perf_counter() - start
+
+            cold = measure()
+            warm = statistics.median([measure() for _ in range(20)])
+        return cold, warm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cold, warm = asyncio.run(run(tmp))
+    print(f"{'turn preview (401 events), cold':<58} {cold * 1000:10.3f} ms")
+    print(f"{'turn preview (401 events), cached':<58} {warm * 1000:10.3f} ms")
+
+
+def bench_store_concurrency() -> None:
+    import asyncio
+    import tempfile
+
+    from deeptutor.services.session.sqlite_store import SQLiteSessionStore
+
+    async def run(tmp: str) -> float:
+        store = SQLiteSessionStore(Path(tmp) / "sessions.db")
+
+        def slow(value: int) -> int:
+            time.sleep(0.02)
+            return value
+
+        start = time.perf_counter()
+        await asyncio.gather(*(store._run(slow, index) for index in range(4)))
+        return time.perf_counter() - start
+
+    with tempfile.TemporaryDirectory() as tmp:
+        elapsed = asyncio.run(run(tmp))
+    print(f"{'4 store ops, 20 ms each (overlapped)':<58} {elapsed * 1000:10.3f} ms")
+    print(f"{'  -> serial would be':<58} {80.0:10.3f} ms")
+
+
+def bench_user_turn_count() -> None:
+    import asyncio
+    import tempfile
+
+    from deeptutor.services.session.sqlite_store import SQLiteSessionStore
+
+    async def run(tmp: str) -> tuple[float, float]:
+        store = SQLiteSessionStore(Path(tmp) / "sessions.db")
+        session = await store.create_session("bench")
+        for index in range(200):
+            await store.add_message(session["id"], "user", f"question {index}")
+            await store.add_message(session["id"], "assistant", f"answer {index}")
+        leaf = await store.add_message(session["id"], "user", "latest")
+
+        start = time.perf_counter()
+        await store.count_user_turns(session["id"], leaf)
+        counted = time.perf_counter() - start
+
+        start = time.perf_counter()
+        await store.get_messages(session["id"])
+        loaded = time.perf_counter() - start
+        return counted, loaded
+
+    with tempfile.TemporaryDirectory() as tmp:
+        counted, loaded = asyncio.run(run(tmp))
+    print(f"{'user-turn count (401 messages), one query':<58} {counted * 1000:10.3f} ms")
+    print(f"{'  -> previous path (load all history)':<58} {loaded * 1000:10.3f} ms")
+
+
+def bench_retry_schedule() -> None:
+    from deeptutor.services.llm.factory import _build_retry_delays
+
+    delays = _build_retry_delays(8, 5.0, True)
+    print(f"{'retry waits, default config':<58} {len(delays)} attempts, {sum(delays):.0f} s total")
+
+
+def bench_file_digest() -> None:
+    import tempfile
+
+    from deeptutor.services.file_digest import file_sha256, reset_file_digest_cache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "big.bin"
+        target.write_bytes(b"x" * (8 * 1024 * 1024))
+        reset_file_digest_cache()
+
+        samples = []
+        for _ in range(6):
+            start = time.perf_counter()
+            file_sha256(target)
+            samples.append(time.perf_counter() - start)
+        _report("sha256 8 MiB file, first read", [samples[0]])
+        _report("sha256 8 MiB file, memoized", samples[1:])
 
 
 def main() -> None:
-    print("DeepTutor batch-1 micro-benchmarks\n")
+    print("DeepTutor performance micro-benchmarks")
     bench_settings_load()
     bench_settings_miss()
     print()
@@ -200,6 +334,14 @@ def main() -> None:
     print()
     bench_answer_assembly()
     bench_token_count()
+    print()
+    print("batch 2")
+    bench_token_cache()
+    bench_turn_preview_cache()
+    bench_store_concurrency()
+    bench_user_turn_count()
+    bench_retry_schedule()
+    bench_file_digest()
 
 
 if __name__ == "__main__":
