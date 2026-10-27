@@ -323,6 +323,161 @@ def bench_file_digest() -> None:
         _report("sha256 8 MiB file, memoized", samples[1:])
 
 
+# ---------------------------------------------------------------------------
+# Batch 3
+# ---------------------------------------------------------------------------
+
+
+def bench_embedding_vector_cache() -> None:
+    import tempfile
+
+    from deeptutor.services.embedding.vector_cache import EmbeddingVectorCache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = EmbeddingVectorCache(Path(tmp) / "vectors.sqlite3", max_entries=100_000)
+        # Create the table and its index first: schema setup is a one-time cost
+        # per workspace, not part of a re-index's per-vector write path.
+        cache.store("warmup", ["warmup"], [[0.0] * 64])
+        texts = [f"chunk-{index}" for index in range(1000)]
+        vectors = [[float(index)] * 64 for index in range(1000)]
+
+        start = time.perf_counter()
+        cache.store("bench", texts, vectors)
+        store_s = time.perf_counter() - start
+
+        start = time.perf_counter()
+        hits = cache.lookup("bench", texts)
+        lookup_s = time.perf_counter() - start
+
+        assert all(hit is not None for hit in hits)
+        print(f"{'embedding cache store 1000x64d':<58} {store_s * 1000:10.3f} ms")
+        print(f"{'embedding cache lookup 1000x64d (hit)':<58} {lookup_s * 1000:10.3f} ms")
+        print(f"{'  -> provider batches avoided on re-index':<58} {1000 / 10:10.0f} batches")
+
+
+def bench_stream_coalescing() -> None:
+    import asyncio
+
+    from deeptutor.runtime.agentic.client import _openai_stream_chunk, _ProviderOpenAIStream
+
+    async def run(count: int) -> tuple[float, int, int]:
+        stream = _ProviderOpenAIStream(
+            provider=None,
+            messages=[],
+            tools=None,
+            model="bench",
+            max_tokens=1,
+            temperature=0.0,
+            reasoning_effort=None,
+            tool_choice=None,
+            extra_kwargs={},
+        )
+        stream._queue = asyncio.Queue()
+        for _ in range(count):
+            stream._queue.put_nowait(_openai_stream_chunk(content="abcd"))
+        stream._queue.put_nowait(None)
+
+        emitted = 0
+        chars = 0
+        start = time.perf_counter()
+        while True:
+            try:
+                chunk = await stream.__anext__()
+            except StopAsyncIteration:
+                break
+            emitted += 1
+            chars += len(chunk.choices[0].delta.content or "")
+        return time.perf_counter() - start, emitted, chars
+
+    elapsed, emitted, chars = asyncio.run(run(2000))
+    assert chars == 8000
+    print(f"{'agentic stream: 2000 token chunks':<58} {elapsed * 1000:10.3f} ms")
+    print(f"{'  -> forwarded events':<58} {emitted:10d} (was 2000)")
+
+
+def bench_merge_throttle() -> None:
+    import asyncio
+
+    from deeptutor.capabilities.subagent.merge_throttle import MergeThrottle
+
+    async def run(count: int) -> tuple[float, int]:
+        emitted = 0
+
+        async def emit(_text: str, _metadata: dict) -> None:
+            nonlocal emitted
+            emitted += 1
+
+        throttle = MergeThrottle(emit, clock=lambda: 0.0)
+        text = ""
+        start = time.perf_counter()
+        for _ in range(count):
+            text += "abcd"
+            await throttle.push("m", text, {})
+        await throttle.flush()
+        return time.perf_counter() - start, emitted
+
+    elapsed, emitted = asyncio.run(run(2000))
+    print(f"{'subagent cumulative text: 2000 deltas':<58} {elapsed * 1000:10.3f} ms")
+    print(f"{'  -> forwarded events':<58} {emitted:10d} (was 2000)")
+
+
+def bench_flush_bookkeeping() -> None:
+    total = 4000
+    events = [{"seq": index} for index in range(total)]
+
+    start = time.perf_counter()
+    persisted: list[dict] = []
+    for end in range(25, total + 1, 25):
+        snapshot = list(events[:end])
+        previous = list(persisted)
+        pending = snapshot[len(previous) :]
+        persisted = previous + list(pending)
+    old = time.perf_counter() - start
+
+    start = time.perf_counter()
+    persisted_count = 0
+    for end in range(25, total + 1, 25):
+        pending = events[persisted_count:end]
+        persisted_count += len(pending)
+    new = time.perf_counter() - start
+
+    print(f"{'flush bookkeeping, 4000 events (old)':<58} {old * 1000:10.3f} ms")
+    print(f"{'flush bookkeeping, 4000 events (count)':<58} {new * 1000:10.3f} ms")
+
+
+def bench_stream_parse_removal() -> None:
+    """The second pass the streaming path no longer runs over every chunk."""
+    from types import SimpleNamespace
+
+    from deeptutor.services.llm.provider_core.openai_compat_provider import (
+        OpenAICompatProvider,
+    )
+
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="abcd",
+                        reasoning_content=None,
+                        reasoning=None,
+                        tool_calls=[],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        )
+        for _ in range(5000)
+    ]
+
+    start = time.perf_counter()
+    response = OpenAICompatProvider._parse_chunks(chunks)
+    elapsed = time.perf_counter() - start
+    assert response.content == "abcd" * 5000
+    print(f"{'old post-stream parse pass, 5000 chunks':<58} {elapsed * 1000:10.3f} ms")
+
+
 def main() -> None:
     print("DeepTutor performance micro-benchmarks")
     bench_settings_load()
@@ -342,6 +497,13 @@ def main() -> None:
     bench_user_turn_count()
     bench_retry_schedule()
     bench_file_digest()
+    print()
+    print("batch 3")
+    bench_embedding_vector_cache()
+    bench_stream_coalescing()
+    bench_merge_throttle()
+    bench_flush_bookkeeping()
+    bench_stream_parse_removal()
 
 
 if __name__ == "__main__":
