@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 # (e.g. PocketBase), which is documented in the multi-user README.
 _USERS_WRITE_LOCK = threading.Lock()
 
+# users.json is read for every turn and every identity lookup. memoize the
+# canonical payload against the file's identity stamp; any write through
+# ``_write_users`` clears it.
+_USERS_CACHE: dict[str, Any] = {}
+_USERS_CACHE_LOCK = threading.Lock()
+
 AUTH_DIR = SYSTEM_ROOT / "auth"
 USERS_FILE = AUTH_DIR / "users.json"
 SECRET_FILE = AUTH_DIR / "auth_secret"
@@ -101,6 +107,32 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_users(users: dict[str, dict[str, Any]]) -> None:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(USERS_FILE, json.dumps(users, indent=2, ensure_ascii=False))
+    # Any writer invalidates the memoized load; the next read re-canonicalizes.
+    with _USERS_CACHE_LOCK:
+        _USERS_CACHE.clear()
+
+
+def _users_file_stamp() -> tuple[str, int, int] | None:
+    try:
+        stat = USERS_FILE.stat()
+    except OSError:
+        return None
+    return (str(USERS_FILE), stat.st_mtime_ns, stat.st_size)
+
+
+def _cached_users(stamp: tuple[str, int, int]) -> dict[str, dict[str, Any]] | None:
+    with _USERS_CACHE_LOCK:
+        entry = _USERS_CACHE.get("entry")
+    if entry is None or entry[0] != stamp:
+        return None
+    # Callers receive records they may treat as their own (and some mutate
+    # them), so hand out a copy rather than the memoized payload.
+    return deepcopy(entry[1])
+
+
+def _store_cached_users(stamp: tuple[str, int, int], users: dict[str, dict[str, Any]]) -> None:
+    with _USERS_CACHE_LOCK:
+        _USERS_CACHE["entry"] = (stamp, deepcopy(users))
 
 
 def _migrate_legacy_users() -> dict[str, dict[str, Any]] | None:
@@ -178,6 +210,14 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
     env_password_hash: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Load canonical users, migrating legacy records and env fallback in memory."""
+    # The env fallback merges a per-call record, so only the plain read is
+    # memoizable; a configured bootstrap admin still recomputes each call.
+    stamp = _users_file_stamp() if not (env_username and env_password_hash) else None
+    if stamp is not None:
+        cached = _cached_users(stamp)
+        if cached is not None:
+            return cached
+
     migrate_legacy_multi_user_tree()
     users: dict[str, dict[str, Any]] | None = None
     if USERS_FILE.exists():
@@ -216,6 +256,11 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
         merged = {env_username: _env_admin_record(env_password_hash)}
         merged.update(canonical)
         return merged
+
+    # Cache only when the read saw a stable file: a rewrite racing this read
+    # would otherwise be memoized under the stale stamp.
+    if stamp is not None and _users_file_stamp() == stamp:
+        _store_cached_users(stamp, canonical)
 
     return canonical
 
