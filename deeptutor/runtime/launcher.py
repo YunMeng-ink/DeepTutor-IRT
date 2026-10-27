@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 from dataclasses import dataclass
 import hashlib
 import json
@@ -708,6 +709,30 @@ def _wait_for_http(
         except (urlerror.URLError, TimeoutError, OSError):
             time.sleep(0.5)
     raise RuntimeError(_t("start.not_ready", name=name, timeout=timeout, env=env_name))
+
+
+def _wait_for_services(
+    *,
+    waits: list[dict[str, Any]],
+    should_stop: Callable[[], bool],
+) -> None:
+    """Wait for every service concurrently; raise the first failure.
+
+    The backend runs migrations and model setup before it serves while the
+    Next server boots independently, so overlapping the two waits removes the
+    frontend's boot time from time-to-browser. The browser is still opened by
+    the caller only after every wait returned, so "ready" keeps meaning ready.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(waits)))
+    try:
+        futures = [pool.submit(_wait_for_http, should_stop=should_stop, **wait) for wait in waits]
+        for future in futures:
+            future.result()
+    finally:
+        # A failed wait must not block the caller while the sibling keeps
+        # polling: the caller terminates the children, and the abandoned wait
+        # then exits on its process-exit check.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _http_ready(url: str, *, timeout: float) -> bool:
@@ -1643,40 +1668,45 @@ def start(
         _log(_t("start.starting_backend"))
         backend = _spawn(backend_cmd, cwd=runtime_home, env=common_env, name="backend")
         processes.append(backend)
-        _wait_for_http(
-            name=_t("start.backend"),
-            url=f"http://127.0.0.1:{backend_port}/",
-            process=backend,
-            timeout=BACKEND_READY_TIMEOUT,
-            env_name=BACKEND_READY_TIMEOUT_ENV,
-            should_stop=should_stop,
-        )
-        if should_stop():
-            return
 
+        # Start both children before waiting on either: the frontend's server
+        # does not depend on the backend being ready, and overlapping their
+        # boots shortens time-to-browser.
         if existing_frontend is not None:
             pid = existing_frontend.pid if existing_frontend.pid is not None else "unknown"
             _log(_t("start.reusing_frontend", url=frontend_url, pid=pid))
-            _wait_for_http(
-                name=_t("start.frontend"),
-                url=frontend_url,
-                process=None,
-                timeout=FRONTEND_READY_TIMEOUT,
-                env_name=FRONTEND_READY_TIMEOUT_ENV,
-                should_stop=should_stop,
-            )
+            frontend_wait: dict[str, Any] = {
+                "name": _t("start.frontend"),
+                "url": frontend_url,
+                "process": None,
+            }
         else:
             _log(_t("start.starting_frontend"))
             web = _spawn(frontend.command, cwd=frontend.cwd, env=common_env, name="frontend")
             processes.append(web)
-            _wait_for_http(
-                name=_t("start.frontend"),
-                url=f"http://127.0.0.1:{frontend_port}/",
-                process=web,
-                timeout=FRONTEND_READY_TIMEOUT,
-                env_name=FRONTEND_READY_TIMEOUT_ENV,
-                should_stop=should_stop,
-            )
+            frontend_wait = {
+                "name": _t("start.frontend"),
+                "url": f"http://127.0.0.1:{frontend_port}/",
+                "process": web,
+            }
+
+        _wait_for_services(
+            waits=[
+                {
+                    "name": _t("start.backend"),
+                    "url": f"http://127.0.0.1:{backend_port}/",
+                    "process": backend,
+                    "timeout": BACKEND_READY_TIMEOUT,
+                    "env_name": BACKEND_READY_TIMEOUT_ENV,
+                },
+                {
+                    **frontend_wait,
+                    "timeout": FRONTEND_READY_TIMEOUT,
+                    "env_name": FRONTEND_READY_TIMEOUT_ENV,
+                },
+            ],
+            should_stop=should_stop,
+        )
         if should_stop():
             return
         _complete_restarted_update(runtime_home)

@@ -153,15 +153,6 @@ async def lifespan(app: FastAPI):
             len(migration_reports["workspace_preferences"]),
         )
 
-    try:
-        from deeptutor.learning.assessment import reconcile_linked_assessments
-
-        recovered, failed = await reconcile_linked_assessments()
-        if recovered or failed:
-            logger.info("Linked assessment recovery: recovered=%s failed=%s", recovered, failed)
-    except Exception:
-        logger.exception("Failed to reconcile linked assessments at startup")
-
     # Initialize LLM client early so OPENAI_* env vars are available before
     # any downstream provider integrations start.
     try:
@@ -312,17 +303,31 @@ async def lifespan(app: FastAPI):
     app.state.background_supervisor = background_supervisor
     await background_supervisor.start()
 
-    # Ping PocketBase if configured — logs a warning (not an error) if unreachable
-    try:
-        from deeptutor.services.pocketbase_client import ping_pocketbase
+    # Independent startup housekeeping. Each step is slow for its own reason
+    # (PocketBase is a network probe, assessment recovery walks the store,
+    # memory migration rewrites files), so they run together instead of
+    # summing their latencies into time-to-ready.
+    async def _recover_linked_assessments() -> None:
+        try:
+            from deeptutor.learning.assessment import reconcile_linked_assessments
 
-        await ping_pocketbase()
-    except Exception as e:
-        logger.warning(f"PocketBase startup check failed: {e}")
+            recovered, failed = await reconcile_linked_assessments()
+            if recovered or failed:
+                logger.info("Linked assessment recovery: recovered=%s failed=%s", recovered, failed)
+        except Exception:
+            logger.exception("Failed to reconcile linked assessments at startup")
 
-    # Migrate any v1 memory files (PROFILE.md / SOUL.md / SUMMARY.md) into a
-    # backup folder so the v2 three-layer subsystem starts clean.
-    try:
+    async def _check_pocketbase() -> None:
+        try:
+            from deeptutor.services.pocketbase_client import ping_pocketbase
+
+            await ping_pocketbase()
+        except Exception as e:
+            logger.warning(f"PocketBase startup check failed: {e}")
+
+    def _run_memory_migration() -> None:
+        # Migrate any v1 memory files (PROFILE.md / SOUL.md / SUMMARY.md) into
+        # a backup folder so the v2 three-layer subsystem starts clean.
         from deeptutor.services.memory import (
             migrate_partner_surface_if_needed,
             migrate_v1_if_needed,
@@ -336,8 +341,20 @@ async def lifespan(app: FastAPI):
         # Rename the legacy ``tutorbot`` memory surface (footnote refs, L2
         # doc, snapshot/trace dirs, L3 meta keys) to ``partner``.
         migrate_partner_surface_if_needed()
-    except Exception as e:
-        logger.warning(f"v1 memory migration failed: {e}")
+
+    async def _migrate_memory() -> None:
+        try:
+            # Pure file I/O: keep it off the event loop while the other checks
+            # keep running.
+            await asyncio.to_thread(_run_memory_migration)
+        except Exception as e:
+            logger.warning(f"v1 memory migration failed: {e}")
+
+    await asyncio.gather(
+        _recover_linked_assessments(),
+        _check_pocketbase(),
+        _migrate_memory(),
+    )
 
     app.state.ready = True
     yield
