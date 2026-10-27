@@ -7,7 +7,6 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-import hashlib
 import itertools
 import json
 import logging
@@ -125,11 +124,9 @@ def _raw_hash_key(file_path: Path, raw_dir: Path) -> str:
 
 
 def _file_hash(file_path: Path) -> str:
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as handle:
-        for block in iter(lambda: handle.read(65536), b""):
-            sha256_hash.update(block)
-    return sha256_hash.hexdigest()
+    from deeptutor.services.file_digest import file_sha256
+
+    return file_sha256(file_path)
 
 
 def hashes_for_indexed_files(file_paths: list[str], raw_dir: Path) -> dict[str, str]:

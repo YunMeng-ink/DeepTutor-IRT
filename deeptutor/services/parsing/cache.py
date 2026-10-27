@@ -19,7 +19,6 @@ both it and the engines share one loader.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
 import json
 import logging
 from pathlib import Path
@@ -37,12 +36,14 @@ _READ_CHUNK = 1 << 20  # 1 MiB
 
 def source_hash_from_path(path: Path) -> str:
     """Hash the *bytes* of ``path`` (not its name) so re-uploads of the same
-    document under a random temp name still hit cache."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(_READ_CHUNK), b""):
-            digest.update(chunk)
-    return digest.hexdigest()[:16]
+    document under a random temp name still hit cache.
+
+    Memoized by file identity: the same document is hashed again by the
+    checkpoint and page-evidence layers during one indexing run.
+    """
+    from deeptutor.services.file_digest import file_sha256
+
+    return file_sha256(path)[:16]
 
 
 def signature_dir(cache_root: Path, source_hash: str, sig_hash: str) -> Path:

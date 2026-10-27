@@ -34,11 +34,9 @@ class SourceRef(BaseModel):
 
 
 def source_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    from deeptutor.services.file_digest import file_sha256
+
+    return file_sha256(path)
 
 
 def resolve_source(ref: SourceRef) -> Path:

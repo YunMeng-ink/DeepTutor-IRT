@@ -28,13 +28,11 @@ def checkpoint_root() -> Path:
 
 
 def job_directory(source: Path, config: MinerUConfig) -> Path:
-    digest = hashlib.sha256()
-    with source.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    from deeptutor.services.file_digest import file_sha256
+
     identity = {
         "version": _VERSION,
-        "source_sha256": digest.hexdigest(),
+        "source_sha256": file_sha256(source),
         "name": source.name,
         "endpoint": config.api_base_url.rstrip("/"),
         "model": config.model_version,
