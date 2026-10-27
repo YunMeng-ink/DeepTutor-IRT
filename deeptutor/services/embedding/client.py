@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import logging
 import threading
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,7 @@ from deeptutor.services.config.provider_runtime import (
 from .adapters import ADAPTER_BACKENDS, BaseEmbeddingAdapter, EmbeddingRequest
 from .config import EmbeddingConfig, get_embedding_config
 from .validation import validate_embedding_batch
+from .vector_cache import get_embedding_vector_cache
 
 
 def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
@@ -116,6 +118,26 @@ class EmbeddingClient:
             f"(model: {self.config.model}, dimensions: {self.config.dim})"
         )
 
+    def _cache_identity(self, role: str | None) -> str:
+        """Everything that changes the vector a provider returns for one text.
+
+        A config edit (model, dimensions, endpoint, role) must miss rather than
+        mix vectors produced by two different models in one index.
+        """
+        endpoint = (self.config.effective_url or self.config.base_url or "").strip()
+        return "|".join(
+            (
+                "v1",
+                str(self.config.binding or ""),
+                str(self.config.model or ""),
+                str(self.config.dim or 0),
+                "1" if self.config.send_dimensions else "0",
+                str(self.config.api_version or ""),
+                hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16],
+                role or "",
+            )
+        )
+
     async def embed(
         self,
         texts: List[str],
@@ -131,6 +153,11 @@ class EmbeddingClient:
         # backend would change the request Jina has always sent (no `task`) and
         # silently invalidate the indexes built from it.
         role = input_type if getattr(self.adapter, "SUPPORTS_INPUT_TYPE", False) else None
+
+        # Re-indexing an unchanged corpus is a cache hit per chunk; a provider
+        # or endpoint change is a miss because the identity covers both.
+        vector_cache = get_embedding_vector_cache()
+        cache_identity = self._cache_identity(role) if vector_cache is not None else ""
 
         # Clamp configured batch size against the provider's per-request item
         # cap. SiliconFlow Qwen3 family caps at 32; DashScope at 20; others
@@ -154,8 +181,18 @@ class EmbeddingClient:
         ]
 
         async def run_batch(index: int, start: int, batch: List[str]) -> List[List[float]]:
+            cached: List[Optional[List[float]]] = [None] * len(batch)
+            missing_positions: List[int] = list(range(len(batch)))
+            if vector_cache is not None:
+                cached = await asyncio.to_thread(vector_cache.lookup, cache_identity, batch)
+                missing_positions = [
+                    position for position, vector in enumerate(cached) if vector is None
+                ]
+                if not missing_positions:
+                    return [vector for vector in cached if vector is not None]
+            missing_texts = [batch[position] for position in missing_positions]
             request = EmbeddingRequest(
-                texts=batch,
+                texts=missing_texts,
                 model=self.config.model,
                 dimensions=self.config.dim or None,
                 input_type=role,
@@ -168,26 +205,37 @@ class EmbeddingClient:
                 # show actionable info instead of a bare exception string.
                 import traceback
 
-                first_chunk_chars = len(batch[0]) if batch else 0
-                longest_chunk_chars = max((len(t) for t in batch), default=0)
+                first_chunk_chars = len(missing_texts[0]) if missing_texts else 0
+                longest_chunk_chars = max((len(t) for t in missing_texts), default=0)
                 self.logger.error(
                     f"Embedding batch failed "
                     f"(binding={self.config.binding}, model={self.config.model}, "
-                    f"batch_index={index + 1}/{total_batches}, batch_items={len(batch)}, "
+                    f"batch_index={index + 1}/{total_batches}, "
+                    f"batch_items={len(missing_texts)}/{len(batch)}, "
                     f"first_chunk_chars={first_chunk_chars}, "
                     f"longest_chunk_chars={longest_chunk_chars}): {exc}\n"
                     f"{traceback.format_exc()}"
                 )
                 raise
-            return validate_embedding_batch(
+            validated = validate_embedding_batch(
                 response.embeddings,
-                expected_count=len(batch),
+                expected_count=len(missing_texts),
                 binding=self.config.binding,
                 model=self.config.model,
                 batch_index=index + 1,
                 total_batches=total_batches,
                 start_index=start,
             )
+            for position, vector in zip(missing_positions, validated):
+                cached[position] = vector
+            if vector_cache is not None:
+                await asyncio.to_thread(
+                    vector_cache.store,
+                    cache_identity,
+                    missing_texts,
+                    validated,
+                )
+            return [vector for vector in cached if vector is not None]
 
         # Progress must stay monotone even though batches finish out of order,
         # otherwise the task stream shows the bar jumping backwards.

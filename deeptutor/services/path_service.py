@@ -131,6 +131,15 @@ class PathService:
         """
         return self._workspace_root / "parse_cache"
 
+    def get_embedding_cache_root(self) -> Path:
+        """Persistent embedding-vector cache, scoped per user/workspace.
+
+        A sibling of ``parse_cache``: both are content-addressed caches whose
+        keys are independent of the knowledge base that happens to query them,
+        so moving data between KBs reuses the work.
+        """
+        return self._workspace_root / "embedding_cache"
+
     def get_chat_history_db(self) -> Path:
         return self._user_data_dir / "chat_history.db"
 
