@@ -11,6 +11,28 @@ class _DummyAgent(BaseAgent):
         return {}
 
 
+def test_prompt_loading_can_be_disabled(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class _Manager:
+        def load_prompts(self, **kwargs):
+            calls.append(kwargs)
+            return {"system": "unused"}
+
+    monkeypatch.setattr("deeptutor.agents.base_agent.get_agent_params", lambda _module: {})
+    monkeypatch.setattr("deeptutor.agents.base_agent.get_prompt_manager", lambda: _Manager())
+
+    agent = _DummyAgent(
+        module_name="chat",
+        agent_name="context_summary_agent",
+        language="en",
+        load_prompts=False,
+    )
+
+    assert agent.prompts is None
+    assert calls == []
+
+
 def test_base_agent_defaults_to_resolved_binding(monkeypatch) -> None:
     """When binding is not explicitly provided, use resolved runtime binding."""
     resolved = LLMConfig(

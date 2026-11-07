@@ -981,6 +981,34 @@ def test_delete_last_turn_leaves_prefix_intact(store: SQLiteSessionStore) -> Non
     assert remaining[1]["id"] == a1
 
 
+def test_delete_summarized_turn_clears_summary_and_watermark(store: SQLiteSessionStore) -> None:
+    sid, ids = _seed_chat(store, turns=2)
+    u1, a1, u2, _a2 = ids
+    asyncio.run(store.update_summary(sid, "SUMMARY TEXT", a1))
+
+    result = asyncio.run(store.delete_turn_by_message(sid, u1))
+    assert result["deleted"] is True
+
+    session = asyncio.run(store.get_session(sid))
+    assert session["compressed_summary"] == ""
+    assert session["summary_up_to_msg_id"] == 0
+
+
+def test_delete_unsummarized_turn_keeps_summary_and_watermark(
+    store: SQLiteSessionStore,
+) -> None:
+    sid, ids = _seed_chat(store, turns=2)
+    _u1, a1, u2, _a2 = ids
+    asyncio.run(store.update_summary(sid, "SUMMARY TEXT", a1))
+
+    result = asyncio.run(store.delete_turn_by_message(sid, u2))
+    assert result["deleted"] is True
+
+    session = asyncio.run(store.get_session(sid))
+    assert session["compressed_summary"] == "SUMMARY TEXT"
+    assert session["summary_up_to_msg_id"] == a1
+
+
 def _seed_turns_with_parked_second(
     store: SQLiteSessionStore, *, stamp: bool = True
 ) -> dict[str, object]:

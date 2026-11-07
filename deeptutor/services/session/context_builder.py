@@ -296,6 +296,9 @@ class _ContextSummaryAgent(BaseAgent):
             module_name="chat",
             agent_name="context_summary_agent",
             language=language,
+            # The summary instruction is supplied per call; there is no
+            # module prompt file to load, and asking for one logs a warning.
+            load_prompts=False,
         )
 
     async def process(self, *_args, **_kwargs) -> dict[str, Any]:
@@ -458,6 +461,7 @@ class ContextBuilder:
         source_text: str,
         summary_budget: int,
         generation_budget: int | None = None,
+        reasoning_effort: str | None = None,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         replay_request: dict[str, Any] | None = None,
     ) -> tuple[str, list[StreamEvent]]:
@@ -594,6 +598,7 @@ class ContextBuilder:
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
                 max_tokens=generation_budget or summary_budget,
+                reasoning_effort=reasoning_effort,
                 stage="summarize_context",
                 trace_meta=trace_meta,
                 outcome=outcome,
@@ -685,6 +690,12 @@ class ContextBuilder:
 
         stored_summary = str(session.get("compressed_summary", "") or "").strip()
         summary_up_to_msg_id = session.get("summary_up_to_msg_id", 0) or 0
+        # A summary is only meaningful with the boundary it was built up to.
+        # Without one it covers turns that are still replayed verbatim: they
+        # count twice, and mastery memory re-summarizes exchanges its notes
+        # already describe. Rebuild from raw instead.
+        if stored_summary and not summary_up_to_msg_id:
+            stored_summary = ""
         # Branch guard: the watermark must sit on this turn's ancestor chain.
         # After an edit-branch switch it may point into a sibling branch — the
         # stored summary would then carry content this branch never saw.
@@ -804,9 +815,13 @@ class ContextBuilder:
             new_summary = ""
             events = []
             # Keep private transcript/provider details out of diagnostics.
+            # ValueError messages are authored here (validation reasons) and
+            # carry no transcript, so the reason is safe and actionable.
+            reason = f": {exc}" if isinstance(exc, ValueError) and str(exc) else ""
             logger.warning(
-                "Context condensation failed (%s); bounding recent history without advancing its watermark",
+                "Context condensation failed (%s%s); bounding recent history without advancing its watermark",
                 type(exc).__name__,
+                reason,
             )
 
         if summarize_ok and new_summary:

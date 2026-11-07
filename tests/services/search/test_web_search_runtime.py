@@ -882,16 +882,27 @@ def test_source_filter_web_risk_caches_lookups() -> None:
 def test_web_risk_batch_has_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     from deeptutor.services.search import source_filter
 
+    # Start from an empty in-flight table so all 12 lookups reach one batch.
+    wait(list(source_filter._web_risk_inflight.values()), timeout=2)
+    source_filter._web_risk_inflight.clear()
     monkeypatch.setattr(source_filter, "_WEB_RISK_BATCH_TIMEOUT_S", 0.05)
+    observed: list[tuple[int, float | None]] = []
+
+    def fake_wait(futures, timeout=None):
+        observed.append((len(futures), timeout))
+        return set(), set()
+
+    monkeypatch.setattr(source_filter, "wait", fake_wait)
 
     def slow(_url: str, *, api_key: str) -> bool:
         time.sleep(0.2)
         return False
 
-    started = time.monotonic()
     urls = [f"https://example.org/page-{i}" for i in range(12)]
     assert source_filter._web_risk_rejections(urls, api_key="test", request_web_risk=slow) == set()
-    assert time.monotonic() - started < 0.15
+    # Wall-clock assertions flake on loaded CI runners; the invariant is that
+    # all lookups share one batch wait with the configured deadline.
+    assert observed == [(12, 0.05)]
     wait(list(source_filter._web_risk_inflight.values()), timeout=2)
 
 

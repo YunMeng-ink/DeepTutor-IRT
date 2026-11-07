@@ -106,8 +106,7 @@ class EmbeddingVectorCache:
                         """
                     )
                     conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_vectors_last_used "
-                        "ON vectors(last_used)"
+                        "CREATE INDEX IF NOT EXISTS idx_vectors_last_used ON vectors(last_used)"
                     )
                     conn.commit()
                     self._schema_ready = True

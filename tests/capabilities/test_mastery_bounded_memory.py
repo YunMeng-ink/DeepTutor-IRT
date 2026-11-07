@@ -147,6 +147,43 @@ async def test_summary_failure_bounds_inline_history_preserves_exact_recall_and_
 
 
 @pytest.mark.asyncio
+async def test_unanchored_memory_summary_is_not_folded_into_the_next_memory() -> None:
+    from deeptutor.capabilities.mastery.memory import archive_id
+    from deeptutor.services.session.model_history import history_groups
+
+    stale = json.dumps(
+        {
+            "version": 1,
+            "covered_archive_ids": [],
+            "learner_state": [{"note": "STALE_SUMMARY_MARKER", "archive_ids": ["hs-tutor-2"]}],
+            "preferences": [],
+            "open_items": [],
+            "teaching_history": [],
+            "source_anchors": [],
+        }
+    )
+    rows = records()
+    store = store_for(rows, summary=stale, watermark=0)
+    builder = MasteryContextBuilder(store)
+    captured: dict = {}
+
+    async def summarize(**kwargs):
+        captured.update(kwargs)
+        return memory([archive_id(g) for g in history_groups(builder._summary_rows)]), []
+
+    builder._summarize = summarize
+    result = await builder.build(
+        session_id="s",
+        llm_config=SimpleNamespace(model="gpt-6.1-sol", context_window=272000, max_tokens=8192),
+    )
+
+    assert "STALE_SUMMARY_MARKER" not in captured["source_text"]
+    assert builder._summary_prior == ""
+    assert result.conversation_summary != stale
+    assert "STALE_SUMMARY_MARKER" not in result.context_text
+
+
+@pytest.mark.asyncio
 async def test_short_session_needs_no_extra_model_call_and_recall_stays_on_selected_branch():
     rows = records(1, 1)
     store = store_for(rows, summary="other branch", watermark=900)
@@ -241,7 +278,10 @@ async def test_provider_truncated_memory_never_advances_watermark_even_if_json_p
     from deeptutor.capabilities.mastery.memory import archive_id
     from deeptutor.services.session.model_history import history_groups
 
+    efforts = []
+
     async def stream(_self, **kwargs):
+        efforts.append(kwargs.get("reasoning_effort"))
         kwargs["outcome"].finish_reason = "max_tokens"
         yield memory([archive_id(g) for g in history_groups(builder._summary_rows)])
 
@@ -252,8 +292,38 @@ async def test_provider_truncated_memory_never_advances_watermark_even_if_json_p
         session_id="s",
         llm_config=SimpleNamespace(model="gpt-6.1-sol", context_window=272000, max_tokens=8192),
     )
+    assert efforts == [None, "low"]
     store.update_summary.assert_not_awaited()
     assert result.token_count <= result.budget
+    assert "example 0 failed" in json.dumps(result.history_sources)
+
+
+@pytest.mark.asyncio
+async def test_truncated_memory_retries_once_with_low_reasoning(monkeypatch):
+    from deeptutor.capabilities.mastery.memory import archive_id
+    from deeptutor.services.session.model_history import history_groups
+
+    efforts = []
+
+    async def stream(_self, **kwargs):
+        efforts.append(kwargs.get("reasoning_effort"))
+        if len(efforts) == 1:
+            kwargs["outcome"].finish_reason = "max_tokens"
+            yield '{"version":1'
+            return
+        kwargs["outcome"].finish_reason = "stop"
+        yield memory([archive_id(g) for g in history_groups(builder._summary_rows)])
+
+    monkeypatch.setattr(_ContextSummaryAgent, "stream_llm", stream)
+    store = store_for(records())
+    builder = MasteryContextBuilder(store)
+    result = await builder.build(
+        session_id="s",
+        llm_config=SimpleNamespace(model="reasoning-model", context_window=272000, max_tokens=4096),
+    )
+    assert efforts == [None, "low"]
+    store.update_summary.assert_awaited_once()
+    assert result.conversation_summary
     assert "example 0 failed" in json.dumps(result.history_sources)
 
 
@@ -378,17 +448,22 @@ async def test_trailing_memory_snapshot_counts_toward_tutoring_budget():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("configured_limit, saved", [(8192, True), (3000, False)])
-async def test_reasoning_allowance_does_not_replace_the_retained_memory_budget(
-    monkeypatch, configured_limit, saved
+@pytest.mark.parametrize("runtime_default, generation", [(4096, 8192), (3000, 6000)])
+async def test_runtime_generation_default_does_not_cap_memory_generation(
+    monkeypatch, runtime_default, generation
 ):
-    """A 4k combined reasoning/output cap repeatedly cut off live JSON memory."""
+    """``LLMConfig.max_tokens`` is the provider fallback, not a configured cap.
+
+    Production resolution never sets it (it stays at 4096), so honoring it here
+    capped memory generation below what a reasoning model spends on hidden
+    tokens and truncated every compaction (#1926).
+    """
     from deeptutor.capabilities.mastery.memory import archive_id
     from deeptutor.services.session.model_history import history_groups
 
     async def stream(_self, **kwargs):
-        kwargs["outcome"].finish_reason = "stop" if kwargs["max_tokens"] >= 5000 else "max_tokens"
-        assert kwargs["max_tokens"] <= configured_limit
+        assert kwargs["max_tokens"] == generation
+        kwargs["outcome"].finish_reason = "stop"
         yield memory([archive_id(g) for g in history_groups(builder._summary_rows)])
 
     monkeypatch.setattr(_ContextSummaryAgent, "stream_llm", stream)
@@ -397,9 +472,9 @@ async def test_reasoning_allowance_does_not_replace_the_retained_memory_budget(
     result = await builder.build(
         session_id="s",
         llm_config=SimpleNamespace(
-            model="reasoning-model", context_window=272000, max_tokens=configured_limit
+            model="reasoning-model", context_window=272000, max_tokens=runtime_default
         ),
     )
-    assert store.update_summary.await_count == int(saved)
+    store.update_summary.assert_awaited_once()
     assert result.token_count <= 20000
     assert "example 0 failed" in json.dumps(result.history_sources)

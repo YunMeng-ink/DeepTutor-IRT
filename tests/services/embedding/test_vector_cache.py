@@ -90,9 +90,7 @@ def test_cache_prunes_to_bound(tmp_path) -> None:
 async def test_client_reuses_cached_vectors(monkeypatch, tmp_path) -> None:
     cache = _cache(tmp_path)
     monkeypatch.setattr(client_module, "get_embedding_vector_cache", lambda: cache)
-    monkeypatch.setattr(
-        client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter
-    )
+    monkeypatch.setattr(client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter)
     _FakeAdapter.instances = []
 
     client = EmbeddingClient(_config())
@@ -107,9 +105,7 @@ async def test_client_reuses_cached_vectors(monkeypatch, tmp_path) -> None:
 async def test_client_embeds_only_cache_misses(monkeypatch, tmp_path) -> None:
     cache = _cache(tmp_path)
     monkeypatch.setattr(client_module, "get_embedding_vector_cache", lambda: cache)
-    monkeypatch.setattr(
-        client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter
-    )
+    monkeypatch.setattr(client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter)
     _FakeAdapter.instances = []
     client = EmbeddingClient(_config())
     cache.store(client._cache_identity(None), ["alpha"], [[9.0, 9.0]])
@@ -126,9 +122,7 @@ async def test_client_embeds_only_cache_misses(monkeypatch, tmp_path) -> None:
 async def test_client_cache_misses_when_model_changes(monkeypatch, tmp_path) -> None:
     cache = _cache(tmp_path)
     monkeypatch.setattr(client_module, "get_embedding_vector_cache", lambda: cache)
-    monkeypatch.setattr(
-        client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter
-    )
+    monkeypatch.setattr(client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter)
     _FakeAdapter.instances = []
 
     await EmbeddingClient(_config(model="model-a")).embed(["alpha"])
@@ -164,9 +158,7 @@ async def test_embedding_concurrency_path_still_reports_progress(monkeypatch, tm
     """A fully cached batch still advances the progress counter."""
     cache = _cache(tmp_path)
     monkeypatch.setattr(client_module, "get_embedding_vector_cache", lambda: cache)
-    monkeypatch.setattr(
-        client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter
-    )
+    monkeypatch.setattr(client_module, "_resolve_adapter_class", lambda _binding: _FakeAdapter)
     _FakeAdapter.instances = []
     client = EmbeddingClient(_config())
     await client.embed(["alpha", "beta", "gamma", "delta"])

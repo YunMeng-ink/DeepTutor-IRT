@@ -11,6 +11,7 @@ from typing import Any
 
 from deeptutor.capabilities.mastery.history import STATE_REFERENCE_NOTICE, project_mastery_replay
 from deeptutor.services.llm.image_replay import deduplicate_user_images
+from deeptutor.services.llm.reasoning_params import RETRY_REASONING_EFFORT
 from deeptutor.services.llm.types import StreamOutcome
 from deeptutor.services.prompt.language import language_label
 from deeptutor.services.session.context_builder import (
@@ -27,6 +28,18 @@ from deeptutor.services.session.model_history import (
 )
 
 _SECTIONS = ("learner_state", "preferences", "open_items", "teaching_history", "source_anchors")
+#: Generation headroom for the memory JSON. Deliberately not
+#: ``LLMConfig.max_tokens``: that field is only the provider fallback (4096)
+#: and no production path sets it. A reasoning model spends it on hidden
+#: tokens before writing any JSON, so capping the summarizer there truncated
+#: every compaction (#1926).
+_MEMORY_GENERATION_TOKENS = 8192
+
+
+class _TruncatedMemory(ValueError):
+    """The provider cut the memory JSON off at its output cap."""
+
+
 MEMORY_NOTICE = (
     "\n\n[Tutoring memory and exact-history recall]\n"
     "A conversation summary is learner memory, NOT authoritative progress or source evidence. "
@@ -93,7 +106,7 @@ class MasteryContextBuilder(ContextBuilder):
     def _finalize_summary(self, summary: str, summary_budget: int, outcome: StreamOutcome) -> str:
         # JSON is atomic: prose-tail trimming destroys a complete object.
         if outcome.truncated:
-            raise ValueError("Tutoring memory: provider truncated the response")
+            raise _TruncatedMemory("Tutoring memory: provider truncated the response")
         return summary
 
     def _model_tokens(self, messages, summary="", route=None):
@@ -102,12 +115,6 @@ class MasteryContextBuilder(ContextBuilder):
         )
 
     async def build(self, *, session_id, leaf_message_id=None, **kwargs):
-        # Retained memory and generation are different budgets: reasoning
-        # providers count hidden tokens in max_tokens too (#1926).
-        configured_limit = getattr(kwargs.get("llm_config"), "max_tokens", None)
-        self._generation_limit = (
-            configured_limit if type(configured_limit) is int and configured_limit > 0 else 8192
-        )
         # The store enforces the active user/session and the selected ancestor
         # chain. No filesystem path, arbitrary session selector, or global search.
         rows = await self.store.get_messages_for_context(
@@ -190,17 +197,28 @@ class MasteryContextBuilder(ContextBuilder):
             if groups
             else source_text
         )
+
         # A summary task needs learning evidence, not the full tutor persona,
         # 47 tool schemas, encrypted provider reasoning or current page pixels.
-        summary, events = await super()._summarize(
-            source_text=material,
-            summary_budget=summary_budget,
-            generation_budget=min(
-                summary_budget * 2, 8192, getattr(self, "_generation_limit", 8192)
-            ),
-            replay_request=None,
-            **kwargs,
-        )
+        async def _run(reasoning_effort: str | None = None):
+            return await ContextBuilder._summarize(
+                self,
+                source_text=material,
+                summary_budget=summary_budget,
+                generation_budget=min(summary_budget * 2, _MEMORY_GENERATION_TOKENS),
+                reasoning_effort=reasoning_effort,
+                replay_request=None,
+                **kwargs,
+            )
+
+        try:
+            summary, events = await _run()
+        except _TruncatedMemory:
+            # A reasoning model can spend the whole generation budget before
+            # emitting any JSON. The project's structured-output policy is one
+            # retry with thinking turned down (services.llm.structured_retry).
+            summary, events = await _run(RETRY_REASONING_EFFORT)
+
         try:
             data = json.loads(summary)
             if not isinstance(data, dict) or data.get("version") != 1:

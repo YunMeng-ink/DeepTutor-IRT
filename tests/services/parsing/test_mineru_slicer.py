@@ -140,9 +140,13 @@ def test_oversized_pdf_is_sliced_into_180_plus_70(
     )
 
     assert len(record) == 2
-    assert [count for _, count in record] == [180, 70]
-    assert calls[0].name == "big_part01.pdf"
-    assert calls[1].name == "big_part02.pdf"
+    # Parts are fetched concurrently, so ``record``/``calls`` reflect completion
+    # order, not page order. Assert the part-to-size mapping instead.
+    assert {path.name: count for path, count in record} == {
+        "big_part01.pdf": 180,
+        "big_part02.pdf": 70,
+    }
+    assert {path.name for path in calls} == {"big_part01.pdf", "big_part02.pdf"}
     assert working_dir == tmp_path / "out" / "big"
     assert (working_dir / "big.md").is_file()
     assert any("part 1/2" in message for message in progress)

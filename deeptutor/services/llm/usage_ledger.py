@@ -69,9 +69,7 @@ def record_call(
 
     ensure_private_directory(path.parent)
     key = str(path)
-    payload = json.dumps(
-        {k: v for k, v in call.items() if k in _CALL_FIELDS}, allow_nan=False
-    )
+    payload = json.dumps({k: v for k, v in call.items() if k in _CALL_FIELDS}, allow_nan=False)
     values = (
         call["call_id"],
         started_at,

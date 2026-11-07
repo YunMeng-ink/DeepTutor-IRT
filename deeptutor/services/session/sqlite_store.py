@@ -2560,8 +2560,12 @@ class SQLiteSessionStore:
             if session_row is not None:
                 summary_up_to = int(session_row["summary_up_to_msg_id"])
                 if any(mid <= summary_up_to for mid in ids_to_delete):
+                    # The summary was folded from turns that no longer exist:
+                    # keep neither it nor its now-unanchored watermark, or the
+                    # stale text keeps leaking into later contexts.
                     conn.execute(
-                        "UPDATE sessions SET summary_up_to_msg_id = 0 WHERE id = ?",
+                        "UPDATE sessions SET summary_up_to_msg_id = 0, "
+                        "compressed_summary = '' WHERE id = ?",
                         (session_id,),
                     )
 

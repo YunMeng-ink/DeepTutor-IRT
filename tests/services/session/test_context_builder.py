@@ -673,6 +673,44 @@ class TestContextBuilderSummarizePaths:
         assert "recent answer" in contents
 
     @pytest.mark.asyncio
+    async def test_failure_reason_is_logged_for_validation_errors(self, caplog) -> None:
+        import logging
+
+        messages = [
+            {"id": 1, "role": "user", "content": "old " * 100},
+            {"id": 2, "role": "assistant", "content": "older reply " * 100},
+            {"id": 3, "role": "user", "content": "mid " * 400},
+            {"id": 4, "role": "assistant", "content": "recent answer"},
+        ]
+        store = _make_store(messages, summary="OLD SUMMARY", up_to=2)
+        builder = ContextBuilder(store=store)
+        builder._summarize = AsyncMock(side_effect=ValueError("Tutoring memory: invalid JSON"))
+
+        with caplog.at_level(logging.WARNING):
+            await builder.build(session_id="s1", llm_config=_small_window_cfg())
+
+        assert "Tutoring memory: invalid JSON" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unanchored_summary_is_discarded(self) -> None:
+        # Deleting a summarized turn can reset the watermark to 0 while the
+        # summary survives. Without its boundary the summary must not be
+        # replayed beside the full transcript: those turns would count twice.
+        messages = [
+            {"id": 1, "role": "user", "content": "Hi"},
+            {"id": 2, "role": "assistant", "content": "Hello!"},
+        ]
+        store = _make_store(messages, summary="STALE SUMMARY", up_to=0)
+        builder = ContextBuilder(store=store)
+        builder._summarize = AsyncMock(return_value=("", []))
+
+        result = await builder.build(session_id="s1", llm_config=_small_window_cfg())
+
+        assert result.conversation_summary == ""
+        assert all(m["role"] != "system" for m in result.conversation_history)
+        builder._summarize.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_branch_switch_discards_sibling_summary(self) -> None:
         # Watermark 99 is not on this branch's ancestor chain: the stored
         # summary was folded from a sibling branch and must not leak in.
@@ -689,6 +727,42 @@ class TestContextBuilderSummarizePaths:
         assert result.conversation_summary == ""
         assert all(m["role"] != "system" for m in result.conversation_history)
         store.update_summary.assert_not_called()
+
+
+def test_context_summary_agent_owns_its_instruction_without_module_prompt(
+    monkeypatch, capsys
+) -> None:
+    from types import SimpleNamespace
+
+    from deeptutor.agents import base_agent
+    from deeptutor.services.session.context_builder import _ContextSummaryAgent
+
+    calls: list[dict[str, Any]] = []
+
+    class _Manager:
+        def load_prompts(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append(kwargs)
+            return {}
+
+    monkeypatch.setattr(base_agent, "get_agent_params", lambda _module: {})
+    monkeypatch.setattr(
+        base_agent,
+        "get_llm_config",
+        lambda: SimpleNamespace(
+            api_key=None,
+            base_url=None,
+            model="test-model",
+            api_version=None,
+            binding="openai",
+        ),
+    )
+    monkeypatch.setattr(base_agent, "get_prompt_manager", lambda: _Manager())
+
+    agent = _ContextSummaryAgent(language="en")
+
+    assert agent.prompts is None
+    assert calls == []
+    assert "No prompt file found" not in capsys.readouterr().out
 
 
 class TestTokenCountCache:
