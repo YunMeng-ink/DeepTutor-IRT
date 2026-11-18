@@ -321,6 +321,62 @@ async def test_failed_first_submission_resends_in_its_original_conversation_with
 
 
 @pytest.mark.asyncio
+async def test_failed_turn_is_durable_before_its_terminal_done_is_visible(submission_service):
+    """A failed DONE must never become visible before the terminal row is written.
+
+    ``subscribe_turn`` returns as soon as it sees a non-``completed`` DONE, so
+    any client that reacts to that signal (retry, resend) reads the turn row
+    immediately afterwards. Publishing DONE first leaves the row at
+    ``running`` for that window, and ``_begin_turn_sync`` then classifies the
+    resend as an in-flight turn and replays the failed result instead of
+    starting a fresh one.
+
+    Asserting on call order (rather than racing a live subscriber) keeps this
+    deterministic: the row must be committed before DONE is published.
+    """
+    service, store, coordinator, _registry, calls = submission_service
+    order: list[str] = []
+
+    original_transition = store.transition_turn
+
+    async def recording_transition(turn_id, status, **kwargs):
+        result = await original_transition(turn_id, status, **kwargs)
+        if status == "failed":
+            order.append("row:failed")
+        return result
+
+    original_publish = coordinator.publish_event
+
+    async def recording_publish(turn_id, payload):
+        result = await original_publish(turn_id, payload)
+        if (
+            payload.get("type") == "done"
+            and (payload.get("metadata") or {}).get("status") == "failed"
+        ):
+            order.append("done:visible")
+        return result
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(store, "transition_turn", recording_transition)
+    monkeypatch.setattr(coordinator, "publish_event", recording_publish)
+    try:
+        calls["fail"] = True
+        _session, failed_turn = await service.start_turn(
+            {"content": "Hello", "client_submission_id": "failed-durable"}
+        )
+        [event async for event in service.subscribe_turn(failed_turn["id"])]
+    finally:
+        monkeypatch.undo()
+
+    assert "done:visible" in order, "the failed turn never published a DONE envelope"
+    assert "row:failed" in order, "the failed turn never committed a terminal row"
+    assert order.index("row:failed") < order.index("done:visible"), (
+        "DONE became visible before the turn row was marked failed (order: "
+        f"{order}); a client retrying in that window replays the failed turn"
+    )
+
+
+@pytest.mark.asyncio
 async def test_submission_key_cannot_be_reused_for_different_content(submission_service):
     service, store, _coordinator, _registry, calls = submission_service
     payload = {"content": "Hello", "client_submission_id": "same-key"}
