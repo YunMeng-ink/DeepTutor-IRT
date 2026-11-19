@@ -1380,6 +1380,27 @@ class TurnExecutor:
                     )
             else:
                 logger.error("Turn %s failed: %s", turn_id, exc, exc_info=True)
+                # Same invariant as the success path above: the terminal row
+                # must be durable before DONE becomes visible. ``subscribe_turn``
+                # returns as soon as it sees a non-``completed`` DONE, so a
+                # client that retries on that signal would otherwise read the
+                # still-``running`` row in ``_begin_turn_sync`` and replay the
+                # failed turn instead of starting a fresh one.
+                with contextlib.suppress(Exception):
+                    await self._flush_buffered_events(execution)
+                try:
+                    await self._transition_execution(
+                        execution,
+                        "failed",
+                        str(exc),
+                        failure_code=resolved_failure_code,
+                        retryable=resolved_retryable,
+                    )
+                except Exception:
+                    # The terminal write is best-effort here: a client that
+                    # never receives DONE hangs forever, which is worse than
+                    # the replay race this ordering fixes.
+                    logger.exception("Failed to persist failed status for turn %s", turn_id)
                 await self._publish_live_event(
                     execution,
                     StreamEvent(
@@ -1405,15 +1426,6 @@ class TurnExecutor:
                             "retryable": resolved_retryable,
                         },
                     ),
-                )
-                with contextlib.suppress(Exception):
-                    await self._flush_buffered_events(execution)
-                await self._transition_execution(
-                    execution,
-                    "failed",
-                    str(exc),
-                    failure_code=resolved_failure_code,
-                    retryable=resolved_retryable,
                 )
         finally:
             if usage_token is not None:
