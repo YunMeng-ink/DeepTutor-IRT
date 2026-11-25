@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,7 @@ from deeptutor.services.llm.context_window import (
 )
 from deeptutor.services.llm.image_replay import deduplicate_user_images
 from deeptutor.services.llm.types import StreamOutcome
+from deeptutor.services.prompt import get_prompt_manager
 from deeptutor.services.prompt.language import language_label
 
 from .ask_user_trace import (
@@ -36,6 +38,7 @@ from .model_history import (
 )
 from .protocol import SessionStoreProtocol
 from .provider_response_state import normalize_provider_response_state
+from .token_encoding import get_local_encoding
 
 logger = logging.getLogger(__name__)
 
@@ -106,41 +109,51 @@ def sanitize_summary(text: str) -> str:
 #: How many distinct texts keep their token count memoized. Counts are tiny
 #: values; only a 128-bit digest of each text is retained, never the text.
 _TOKEN_CACHE_MAX = 8192
-_token_cache: OrderedDict[tuple[int, str], int] = OrderedDict()
+_token_cache: OrderedDict[tuple[bool, int, str], int] = OrderedDict()
 _token_cache_lock = threading.Lock()
 
 
-def _token_cache_key(text: str) -> tuple[int, str]:
+def _token_cache_key(text: str, has_encoding: bool) -> tuple[bool, int, str]:
     encoded = text.encode("utf-8", "surrogatepass")
-    return (len(encoded), hashlib.blake2b(encoded, digest_size=16).hexdigest())
+    return (has_encoding, len(encoded), hashlib.blake2b(encoded, digest_size=16).hexdigest())
 
 
-def _encode_token_count(text: str) -> int:
+def _encode_token_count(text: str, encoding: Any | None) -> int:
+    """Count with the local verified encoding when present, else chars/4."""
+    if encoding is None:
+        return max(1, len(text) // 4)
     try:
-        import tiktoken
-
-        encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     except Exception:
         return max(1, len(text) // 4)
 
 
 def count_tokens(text: str) -> int:
-    """Estimate token count with tiktoken when available.
+    """Estimate token count with a local verified encoding when available.
 
-    Memoized by content digest: the loop re-counts the same history messages
-    before every round, and the binary search in ``_select_recent_messages``
-    re-counts overlapping tails. Encoding is the expensive half of both.
+    The encoding comes from :func:`token_encoding.get_local_encoding`, which
+    never starts a download, never blocks, and only ever hands back a
+    ``cl100k_base`` built from locally hash-verified ranks (acquired in the
+    background): while that is pending, or with a cold, disabled or corrupt
+    cache, this stays on the chars/4 heuristic instead of letting
+    ``get_encoding`` hang the event loop on a no-timeout CDN fetch (#2522).
+
+    Memoized by content digest and encoding availability: the loop re-counts
+    the same history messages before every round, and the binary search in
+    ``_select_recent_messages`` re-counts overlapping tails. Encoding is the
+    expensive half of both. Availability is part of the key so a count taken
+    on the heuristic is not pinned after the background acquisition lands.
     """
     if not text:
         return 0
-    key = _token_cache_key(text)
+    encoding = get_local_encoding()
+    key = _token_cache_key(text, encoding is not None)
     with _token_cache_lock:
         cached = _token_cache.get(key)
         if cached is not None:
             _token_cache.move_to_end(key)
             return cached
-    value = _encode_token_count(text)
+    value = _encode_token_count(text, encoding)
     with _token_cache_lock:
         _token_cache[key] = value
         while len(_token_cache) > _TOKEN_CACHE_MAX:
@@ -305,11 +318,27 @@ class _ContextSummaryAgent(BaseAgent):
         raise NotImplementedError
 
 
+class HistoryBudgetExceeded(ValueError):
+    """Retained history cannot fit without cutting a complete exchange."""
+
+    error_code = "history_budget_exceeded"
+    retryable = False
+
+    def __init__(self, token_count: int, budget: int) -> None:
+        self.token_count = token_count
+        self.budget = budget
+        super().__init__(
+            f"Retained conversation history exceeds its budget ({token_count} estimated tokens "
+            f"for a {budget}-token plan). Start a new conversation or shorten the oversized "
+            "earlier exchange. Stored messages have been preserved."
+        )
+
+
 class ContextBuilder:
     """Construct history against a bounded plan plus optional summary trace.
 
-    The budget is a planning target, not destructive truncation: the newest
-    non-empty message is retained even when that single message exceeds it.
+    Older whole exchanges can be omitted from the request. If the remaining
+    exchange still exceeds the plan, fail explicitly and preserve stored data.
     """
 
     def __init__(
@@ -442,16 +471,25 @@ class ContextBuilder:
             # only when it differs from the revision already replayed with the
             # history. Count what the request will actually carry.
             pending = summary_snapshot(summary)
-            if pending is not None and not any(
-                item.get("_context_snapshot") == SUMMARY_SNAPSHOT_NAME
-                and item.get("content") == pending["content"]
-                for item in replayed
-            ):
+            previous_summary = next(
+                (
+                    item.get("content")
+                    for item in reversed(replayed)
+                    if item.get("_context_snapshot") == SUMMARY_SNAPSHOT_NAME
+                ),
+                None,
+            )
+            if pending is not None and previous_summary != pending["content"]:
                 tokens += _count_model_context_tokens(pending)
             return tokens
         return count_tokens(build_history_text(self._build_history(summary, messages))) + sum(
             _provider_response_state_tokens(row) for row in messages
         )
+
+    def _check_history_budget(self, token_count: int, budget: int) -> None:
+        """Validate the final plan; exact-recall builders can defer until projection."""
+        if token_count > budget:
+            raise HistoryBudgetExceeded(token_count, budget)
 
     async def _summarize(
         self,
@@ -469,6 +507,7 @@ class ContextBuilder:
         if not source_text.strip():
             return "", events
 
+        system_prompt = self._summary_instruction(language)
         agent = _ContextSummaryAgent(language=language)
         trace_meta = build_trace_metadata(
             call_id=new_call_id("context-summary"),
@@ -565,7 +604,6 @@ class ContextBuilder:
         # turns it condensed have scrolled out. Unstated, a summary of a
         # foreign-language session comes back in the default language and the
         # reply follows it — #1511's drift "after a few rounds".
-        system_prompt = self._summary_instruction(language)
         user_prompt = (
             f"Update the summary using the material below. "
             f"Keep the total under {target_tokens} tokens.\n\n{source_text}"
@@ -605,6 +643,8 @@ class ContextBuilder:
                 **replay_kwargs,
             ):
                 _chunks.append(_c)
+            if outcome.finish_reason == "error":
+                raise RuntimeError("Context summarization stream failed")
             summary = sanitize_summary("".join(_chunks))
             return self._finalize_summary(summary, summary_budget, outcome), events
         finally:
@@ -627,43 +667,11 @@ class ContextBuilder:
 
     def _summary_instruction(self, language: str) -> str:
         """The summary task's policy, independently of a tutor's large prompt."""
-        summary_language = language_label(language)
-        system_prompt = (
-            "You maintain a running summary of a conversation so future turns can "
-            "continue seamlessly. Rewrite the summary from the material provided, "
-            "organized under these headings (omit any heading with no content):\n"
-            "- Goals: what the user wants to accomplish, and why if stated\n"
-            "- Key facts & context: stable facts, definitions, data points, names, "
-            "references (files, links, IDs)\n"
-            "- Decisions & preferences: choices made, options rejected, style or "
-            "format preferences, capability/mode switches\n"
-            "- Progress: what has been produced or completed so far\n"
-            "- Open items: unanswered questions, pending tasks, known blockers\n"
-            "Carry forward still-relevant entries from the existing summary unchanged "
-            "unless new information contradicts them; drop only what is obsolete. "
-            "Prefer concrete details (numbers, identifiers, exact terms) over "
-            "abstract restatement. Never invent information. "
-            "Output the summary body only: no preamble, no drafting notes, no "
-            "step-by-step reasoning, and no <think> blocks — start directly at "
-            "the first heading. "
-            f"Write the summary itself in {summary_language}."
-        )
-        if language.startswith("zh"):
-            system_prompt = (
-                "你负责维护一份对话的滚动摘要，供后续轮次无缝衔接。请基于给定材料重写摘要，"
-                "按以下小节组织（无内容的小节直接省略）：\n"
-                "- 目标：用户想完成什么，以及（如有说明）原因\n"
-                "- 关键事实与上下文：稳定的事实、定义、数据、名称、引用（文件、链接、ID）\n"
-                "- 决定与偏好：已做的选择、被否决的方案、风格/格式偏好、能力或模式切换\n"
-                "- 进展：目前已经产出或完成的内容\n"
-                "- 待办事项：未回答的问题、未完成的任务、已知阻塞\n"
-                "已有摘要中仍然有效的条目应原样保留，仅在新信息与之矛盾时修改，只删除确已过时"
-                "的内容。优先保留具体细节（数字、标识符、确切措辞），不要抽象转述，绝不虚构。"
-                "只输出摘要正文：不要输出任何思考过程或 <think> 标记，不要写草稿、不要写"
-                "「Let me…」「Draft:」之类的推演，直接从第一个小节标题开始。"
-                f"摘要正文本身请使用{summary_language}撰写。"
-            )
-        return system_prompt
+        prompts = get_prompt_manager().load_prompts("chat", "context_summary_agent", language)
+        system_prompt = prompts.get("system")
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ValueError("Context summary system prompt is not configured")
+        return system_prompt.format(summary_language=language_label(language)).strip()
 
     async def build(
         self,
@@ -719,6 +727,23 @@ class ContextBuilder:
         route = (
             {"provider": binding, "model": llm_config.model} if isinstance(binding, str) else None
         )
+        if os.getenv("DEEPTUTOR_CHAT_ENGINE") == "typescript-native":
+            from deeptutor.runtime.ts_engine.config import compatibility_reason
+
+            if not compatibility_reason(llm_config):
+                from .native_history import build_native_history
+
+                return await build_native_history(
+                    self,
+                    session_id=session_id,
+                    llm_config=llm_config,
+                    language=language,
+                    messages=messages,
+                    unsummarized=unsummarized,
+                    summary=stored_summary,
+                    route=route,
+                    on_event=on_event,
+                )
         current_history = self._build_history(stored_summary, unsummarized)
         current_tokens = self._model_tokens(unsummarized, stored_summary, route)
         previous_model_turn = next(
@@ -845,6 +870,8 @@ class ContextBuilder:
         ):
             retained_groups.pop(0)
             retained_rows = [row for group in retained_groups for row in group]
+        final_tokens = self._model_tokens(retained_rows, stored_summary, route)
+        self._check_history_budget(final_tokens, budget)
         final_history = self._build_history(stored_summary, retained_rows)
 
         final_text = build_history_text(final_history)
@@ -853,7 +880,7 @@ class ContextBuilder:
             conversation_summary=stored_summary,
             context_text=final_text,
             events=events,
-            token_count=self._model_tokens(retained_rows, stored_summary, route),
+            token_count=final_tokens,
             budget=budget,
             model_history=replay_history(retained_rows, stored_summary, route),
             previous_model_turn=previous_model_turn,
@@ -863,6 +890,7 @@ class ContextBuilder:
 __all__ = [
     "ContextBuildResult",
     "ContextBuilder",
+    "HistoryBudgetExceeded",
     "TRUNCATION_GUARD_RATIO",
     "build_history_text",
     "count_tokens",

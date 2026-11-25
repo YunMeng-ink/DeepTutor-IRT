@@ -29,6 +29,14 @@ class Attachment:
     # Populated by ``extract_documents_from_records`` so the frontend can
     # show "what the LLM saw" when previewing office files.
     extracted_text: str = ""
+    # True when this image was NOT uploaded with the current message but
+    # re-attached from an earlier message of the same conversation (#2632).
+    # The multimodal layer labels such images so the model does not mistake
+    # them for a fresh upload. Current-turn uploads keep the default.
+    historical: bool = False
+    # Id of the message the attachment originally arrived with; empty for
+    # current-turn uploads.
+    source_message_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +59,12 @@ class WorkspaceRuntimeContext:
 class TurnRuntimeContext:
     """Non-serializable execution state owned by the runtime adapter."""
 
+    loop_extensions: dict[str, Any] = field(default_factory=dict, repr=False)
     turn_id: str = ""
     wait_for_user_reply: Callable[[], Awaitable[dict[str, Any] | None]] | None = None
+    # Takes the messages the learner sent while this turn was running
+    # (``[{command_id, content}]``, oldest first); the loop reads it between steps.
+    drain_user_inputs: Callable[[], list[dict[str, Any]]] | None = None
     provider_response_state: dict[str, Any] | None = None
     # Private model history and this turn's retained protocol. Display history
     # remains separate so non-loop capabilities and public APIs keep their view.
@@ -62,6 +74,7 @@ class TurnRuntimeContext:
     subagent_consult_budget: int | None = None
     consult_partner_id: str | None = None
     partner_discussion_group_id: str | None = None
+    answer_by: str | None = None
     min_loop_rounds: int = 0
     workspace: WorkspaceRuntimeContext | None = None
 

@@ -28,10 +28,10 @@ import {
   MessageSquare,
   Pencil,
   RefreshCcw,
+  RotateCcw,
   Square,
   UserRound,
   UsersRound,
-  Volume2,
   X,
   Trash2,
   type LucideIcon,
@@ -40,10 +40,12 @@ import { useTranslation } from "react-i18next";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import { ActivityFold, FoldCaret } from "@/components/activity";
+import { LearningText } from "@/components/common/LearningText";
 import AssistantResponse from "@/components/common/AssistantResponse";
 import {
   InlineFileCardProvider,
   mergeGeneratedFiles,
+  unlinkedGeneratedFiles,
 } from "@/components/common/InlineFileCard";
 import Tooltip from "@/shared/ui/Tooltip";
 import type {
@@ -53,12 +55,19 @@ import type {
 import { apiFetch, apiUrl } from "@/lib/api";
 import { notify } from "@/lib/notifications";
 import { docIconFor } from "@/lib/doc-attachments";
-import { useVoiceAutoplay } from "@/hooks/useVoiceAutoplay";
+import { isQuoteAttachment, quoteText } from "@/lib/quote-attachments";
+import { QUOTE_RULE_CLASS } from "@/components/chat/home/QuotedPassage";
+
 import {
-  SPEECH_PLAYBACK_FAILURE_MESSAGE,
-  SPEECH_TIMEOUT_MESSAGE,
-} from "@/lib/voice-settings";
+  GeneratedOutputFileActions,
+  supportsGeneratedOutputActions,
+} from "@/components/chat/GeneratedOutputFileActions";
+import { PlayAudioButton } from "@/components/voice/SpeechButton";
+export { PlayAudioButton } from "@/components/voice/SpeechButton";
+import { activeWorkspaceId } from "@/lib/workspace-scope";
+import { useVoicePlaybackRate, VOICE_PLAYBACK_RATES } from "@/hooks/useVoicePlaybackRate";
 import { extractMathAnimatorResult } from "@/lib/math-animator-types";
+import { extractVideoLessonResult } from "@/lib/video-lesson-types";
 import {
   extractQuizQuestions,
   extractQuizTurnId,
@@ -68,6 +77,8 @@ import { extractVisualizeResult } from "@/lib/visualize-types";
 import type { StreamEvent } from "@/features/chat/model/protocol";
 import { hasVisibleMarkdownContent } from "@/lib/markdown-display";
 import type { SelectedBookReference } from "@/lib/book-references";
+import type { SessionSummary } from "@/lib/session-api";
+import MessageThreadMarker from "./MessageThreadMarker";
 import { buildVisiblePath, type SiblingInfo } from "@/lib/message-branches";
 import { turnAnchorKey } from "@/lib/chat-outline";
 import { readingPassageHref } from "@/lib/reading-citations";
@@ -94,10 +105,8 @@ import { SetupCredentialCard } from "@/components/chat/home/SetupCredentialCard"
 import { extractSetupCredential } from "@/lib/setup-signals";
 import { PartnerDraftCard } from "@/components/chat/home/PartnerDraftCard";
 import { extractPartnerDraft } from "@/lib/partner-draft";
-import {
-  extractCourseHandoffs,
-  stripLeakedHandoffJson,
-} from "@/lib/course-handoff";
+import { CreationDraftCard } from "@/components/chat/home/CreationDraftCard";
+import { extractCreationDraft } from "@/lib/creation-draft";
 import { extractMasteryHandoffs } from "@/lib/mastery-handoff";
 import ContextReferenceTree, {
   type ContextTreeItem,
@@ -113,6 +122,9 @@ import { supportsSubmissionReplacement, type OrphanedFailedTurn } from "@/lib/se
 import { agentGlyph } from "@/components/agents/agent-icons";
 import { useConsultationReference } from "@/hooks/useConsultationReference";
 import { useConnectedAgentKinds } from "@/hooks/useConnectedAgentKinds";
+import { usePartner } from "@/hooks/usePartnerRoster";
+import { AnswererMark } from "@/features/chat/trace/AnswererMark";
+import { answererOf, parseAnswerBy } from "@/features/chat/trace/answerer";
 import {
   authoritativeResearchReport,
   isConfirmedResearchFollowup,
@@ -130,8 +142,8 @@ const MasterySourcePresentation = dynamic(
   () => import("@/components/chat/home/MasterySourcePresentation").then(module => module.MasterySourcePresentation),
   { ssr: false },
 );
-const CourseHandoffCards = dynamic(
-  () => import("@/components/chat/home/CourseHandoffCard").then(module => module.CourseHandoffCards),
+const MasterySourcePages = dynamic(
+  () => import("@/components/chat/home/MasterySourcePresentation").then(module => module.MasterySourcePages),
   { ssr: false },
 );
 const MasteryHandoffCards = dynamic(
@@ -150,6 +162,10 @@ const VisualizationViewer = dynamic(
   () => import("@/components/visualize/VisualizationViewer"),
   { ssr: false },
 );
+const VideoLessonViewer = dynamic(
+  () => import("@/components/video-lesson/VideoLessonViewer"),
+  { ssr: false },
+);
 
 
 interface ChatMessageItem {
@@ -165,6 +181,7 @@ interface ChatMessageItem {
   /** The server never accepted this submission (#1594) — rendered as an
    *  unsent message, not an ordinary sent one. */
   failedSubmission?: boolean;
+  failedSubmissionNoLlmAccess?: boolean;
   failedSubmissionNeedsReview?: boolean;
   orphanedFailedTurn?: OrphanedFailedTurn;
 }
@@ -182,6 +199,7 @@ const MODE_BADGE_LABELS: Record<string, string> = {
   deep_question: "Quiz Generation",
   deep_research: "Deep Research",
   math_animator: "Math Animator",
+  video_lesson: "Video Lesson",
   visualize: "Visualize",
   mastery_path: "Mastery Path",
   immersive_reading: "Immersive Reading",
@@ -379,6 +397,33 @@ function ProcessFold({
 }
 
 /**
+ * What the learner sent while this turn was working, where the turn read it.
+ *
+ * Drawn as the learner's own bubble, only smaller, so the reply reads as one
+ * conversation: the work above was done before it arrived, and everything
+ * below was written knowing it.
+ */
+function SentMidTurn({ messages }: { messages: string[] }) {
+  const { t } = useTranslation();
+  return (
+    <div data-sent-mid-turn="true" className="my-3 flex flex-col items-end gap-1">
+      <span className="pr-1 text-[11px] text-[var(--muted-foreground)]">
+        {t("You, while it worked")}
+      </span>
+      {messages.map((text, index) => (
+        <div
+          key={index}
+          dir="auto"
+          className="max-w-[85%] whitespace-pre-wrap rounded-2xl bg-[var(--secondary)] px-3.5 py-2 text-[13.5px] leading-relaxed text-[var(--foreground)]"
+        >
+          <LearningText size={13.5}>{text}</LearningText>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
  * One row of the assistant message: a run of working-out, a card, or answer
  * prose. Cards and the answer stand on their own; a process run is what the
  * turn did before either of them and folds away once the turn has settled.
@@ -422,7 +467,6 @@ function buildMessageBlocks(
   });
   // Keep Mastery teaching/feedback visible before an assessment arrives and
   // when a turn ends with bookkeeping without posing an assessment at all.
-  // Explicitly retracted prose is already a trace, not a text segment.
   if (isMastery) preserveTeachingBefore(segments.length);
   const blocks: MessageBlock[] = [];
   let run: MessageSegment[] = [];
@@ -434,7 +478,11 @@ function buildMessageBlocks(
   segments.slice(0, answerStart).forEach((segment, index) => {
     if (
       (segment.kind === "ask_user" && !segment.data.resolved) ||
-      segment.kind === "mastery_question"
+      segment.kind === "mastery_question" ||
+      // A presented lesson page is part of the lesson, not working-out.
+      segment.kind === "source_view" ||
+      // The learner's own words are conversation, not working-out to fold.
+      segment.kind === "user_input"
     ) {
       flush();
       blocks.push({ kind: "card", key: segment.key, segment });
@@ -532,21 +580,31 @@ function humanizeFilename(filename: string): string {
  * side panel, same path as user uploads. Sources: persisted ``generated``
  * attachments on the message (durable) merged with artifacts from streamed
  * tool_result events (live, while the turn is still running), deduped by URL.
+ *
+ * An image the reply already embeds with ``![](...)`` is drawn there, so its
+ * card is left out; showing both reads as the figure appearing twice.
  */
 export function GeneratedFileCards({
   attachments,
   events,
+  content,
   onOpen,
 }: {
   attachments: MessageAttachment[];
   events?: StreamEvent[];
+  /** The reply text, used to tell which images are already shown inline. */
+  content?: string;
   onOpen?: (attachment: MessageAttachment) => void;
 }) {
   const { t } = useTranslation();
-  const files = useMemo(
-    () => mergeGeneratedFiles(attachments, events),
-    [attachments, events],
-  );
+  const files = useMemo(() => {
+    const merged = mergeGeneratedFiles(attachments, events);
+    if (!content) return merged;
+    const unlinked = new Set(unlinkedGeneratedFiles(content, merged, { imagesOnly: true }));
+    return merged.filter(
+      (file) => !file.mime_type?.startsWith("image/") || unlinked.has(file),
+    );
+  }, [attachments, events, content]);
   if (!files.length) return null;
   return (
     <div className="mt-3 flex flex-col gap-2">
@@ -560,35 +618,39 @@ export function GeneratedFileCards({
         // Generated media renders inline; other MIME types use a file card.
         if (mime.startsWith("image/") && mediaSrc) {
           return (
-            <button
-              key={key}
-              type="button"
-              onClick={onOpen ? () => onOpen(a) : undefined}
-              className="group block w-full max-w-[min(520px,90%)] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] text-left shadow-sm transition hover:border-[var(--border)]"
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={mediaSrc}
-                alt={filename}
-                loading="lazy"
-                className="block max-h-[360px] w-full bg-[var(--background)] object-contain"
-              />
-              <span className="flex items-center justify-between gap-2 px-3 py-2">
-                <span className="min-w-0">
-                  <span className="block truncate text-[12.5px] font-medium text-[var(--foreground)]">
-                    {a.title || humanizeFilename(filename)}
-                  </span>
-                  {caption ? (
-                    <span className="block truncate text-[11px] text-[var(--muted-foreground)]">
-                      {caption}
+            <div key={key} className="w-full max-w-[min(520px,90%)]">
+              <button
+                type="button"
+                onClick={onOpen ? () => onOpen(a) : undefined}
+                className="group block w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)] text-left shadow-sm transition hover:border-[var(--border)]"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={mediaSrc}
+                  alt={filename}
+                  loading="lazy"
+                  className="block max-h-[360px] w-full bg-[var(--background)] object-contain"
+                />
+                <span className="flex items-center justify-between gap-2 px-3 py-2">
+                  <span className="min-w-0">
+                    <span className="block truncate text-[12.5px] font-medium text-[var(--foreground)]">
+                      {a.title || humanizeFilename(filename)}
                     </span>
-                  ) : null}
+                    {caption ? (
+                      <span className="block truncate text-[11px] text-[var(--muted-foreground)]">
+                        {caption}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="shrink-0 text-[11px] text-[var(--muted-foreground)] transition group-hover:text-[var(--foreground)]">
+                    {t("Open")}
+                  </span>
                 </span>
-                <span className="shrink-0 text-[11px] text-[var(--muted-foreground)] transition group-hover:text-[var(--foreground)]">
-                  {t("Open")}
-                </span>
-              </span>
-            </button>
+              </button>
+              {supportsGeneratedOutputActions(a) ? (
+                <GeneratedOutputFileActions url={a.url || ""} />
+              ) : null}
+            </div>
           );
         }
 
@@ -623,6 +685,9 @@ export function GeneratedFileCards({
                   {t("Open")}
                 </span>
               </button>
+              {supportsGeneratedOutputActions(a) ? (
+                <GeneratedOutputFileActions url={a.url || ""} />
+              ) : null}
             </div>
           );
         }
@@ -631,28 +696,32 @@ export function GeneratedFileCards({
         const Icon = spec.Icon;
         const size = formatFileSize(a.size_bytes);
         return (
-          <button
-            key={key}
-            type="button"
-            onClick={onOpen ? () => onOpen(a) : undefined}
-            className="group flex w-full max-w-[min(520px,90%)] items-center gap-3 rounded-xl border border-[var(--border)] bg-[var(--card)] px-3 py-2.5 text-left shadow-sm transition hover:border-[var(--border)] hover:bg-[var(--muted)]/30"
-          >
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--background)]">
-              <Icon className={`h-[18px] w-[18px] ${spec.tint}`} />
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-[13px] font-medium text-[var(--foreground)]">
-                {a.title || humanizeFilename(filename)}
+          <div key={key} className="w-full max-w-[min(520px,90%)]">
+            <button
+              type="button"
+              onClick={onOpen ? () => onOpen(a) : undefined}
+              className="group flex w-full items-center gap-3 rounded-xl border border-[var(--border)] bg-[var(--card)] px-3 py-2.5 text-left shadow-sm transition hover:border-[var(--border)] hover:bg-[var(--muted)]/30"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--background)]">
+                <Icon className={`h-[18px] w-[18px] ${spec.tint}`} />
               </span>
-              <span className="block text-[11px] text-[var(--muted-foreground)]">
-                {caption || spec.label}
-                {size ? ` · ${size}` : ""}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[13px] font-medium text-[var(--foreground)]">
+                  {a.title || humanizeFilename(filename)}
+                </span>
+                <span className="block text-[11px] text-[var(--muted-foreground)]">
+                  {caption || spec.label}
+                  {size ? ` · ${size}` : ""}
+                </span>
               </span>
-            </span>
-            <span className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--foreground)] transition group-hover:bg-[var(--muted)]/40">
-              {t("Open")}
-            </span>
-          </button>
+              <span className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--foreground)] transition group-hover:bg-[var(--muted)]/40">
+                {t("Open")}
+              </span>
+            </button>
+            {supportsGeneratedOutputActions(a) ? (
+              <GeneratedOutputFileActions url={a.url || ""} />
+            ) : null}
+          </div>
         );
       })}
     </div>
@@ -747,6 +816,14 @@ export const AssistantMessage = memo(function AssistantMessage({
   const readingMaterialId = researchRequestSnapshot?.readingMaterialId;
   const readingMaterialRevision =
     researchRequestSnapshot?.readingMaterialRevision;
+  // The language this reply was generated in, as recorded on the turn's
+  // request snapshot when it was sent. Prose is tagged with it rather than
+  // the session's current language so changing the reply language never
+  // re-tags past replies (a Chinese answer keeps zh fonts after the session
+  // moves on to Japanese). Replies without a recorded language — legacy
+  // rows from before snapshots carried it — fall back to the session
+  // language, which is the best guess available for them.
+  const turnLanguage = researchRequestSnapshot?.language || language;
   const resultEvent = useMemo(
     () => msg.events?.find((event) => event.type === "result") ?? null,
     [msg.events],
@@ -797,6 +874,20 @@ export const AssistantMessage = memo(function AssistantMessage({
     if (msg.capability !== "visualize" || !resultEvent) return null;
     return extractVisualizeResult(resultEvent.metadata);
   }, [msg.capability, resultEvent]);
+
+  const videoLessonResult = useMemo(() => {
+    // A one-turn capability or a resumed turn may still have the composer's
+    // chat label. The capability that emitted the result is authoritative.
+    // Ignore earlier intermediate results that do not carry a playable page.
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event.type !== "result" ||
+          (event.source !== "video_lesson" && msg.capability !== "video_lesson")) continue;
+      const lesson = extractVideoLessonResult(event.metadata);
+      if (lesson) return lesson;
+    }
+    return null;
+  }, [msg.capability, events]);
 
   // Detect the ``ask_user`` terminator payload: when the assistant turn
   // ended via the ``ask_user`` tool, this is the question the user is
@@ -877,15 +968,14 @@ export const AssistantMessage = memo(function AssistantMessage({
     [msg.events],
   );
 
-  // Set by ``course_handoff`` when Course Study has decided what is worth doing
-  // next. A turn may propose more than one, so this is a list.
-  const courseHandoffs = useMemo(
-    () => extractCourseHandoffs(msg.events),
+  const creationDraft = useMemo(
+    () => extractCreationDraft(msg.events),
     [msg.events],
   );
 
+
   // Set by the mastery navigation tools when the learner asked to be taken
-  // back to something they are studying. Same shape of offer as above — a
+  // back to something they are studying. The offer carries a
   // destination, a reason, an editable opening line — for the surface that
   // actually teaches it.
   const masteryHandoffs = useMemo(
@@ -893,18 +983,7 @@ export const AssistantMessage = memo(function AssistantMessage({
     [msg.events],
   );
 
-  // Some models write the hand-off out as literal JSON *and* call the tool, so
-  // the card's own contents appear above it as raw arguments. Only stripped
-  // once the turn is finished — mid-stream the text is still arriving and a
-  // partial object would not match anyway — and only from a message that really
-  // produced a card.
-  const body = useMemo(
-    () =>
-      courseHandoffs.length && !isStreaming
-        ? stripLeakedHandoffJson(msg.content)
-        : msg.content,
-    [courseHandoffs.length, isStreaming, msg.content],
-  );
+  const body = msg.content;
 
   // Interleaved segments for the default chat surface: the message is laid
   // out in the order it was written — what DeepTutor said it was about to do,
@@ -916,6 +995,7 @@ export const AssistantMessage = memo(function AssistantMessage({
     !outlinePreview &&
     !mathAnimatorResult &&
     !visualizeResult &&
+    !videoLessonResult &&
     !(quizQuestions && quizQuestions.length > 0);
   const messageSegments = useMemo(
     () =>
@@ -926,6 +1006,16 @@ export const AssistantMessage = memo(function AssistantMessage({
         : [],
     [useInlineSegments, msg.events, msg.content, isStreaming],
   );
+  // Pages already drawn at the tool call that presented them; the fallback
+  // below only stacks the ones this layout had no place for.
+  const placedSourcePages = useMemo(() => {
+    const urls = new Set<string>();
+    if (!useInlineSegments) return urls;
+    for (const seg of messageSegments) {
+      if (seg.kind === "source_view") seg.pages.forEach(page => urls.add(page.preview_url));
+    }
+    return urls;
+  }, [useInlineSegments, messageSegments]);
   // Either card kind: a clarifying ask_user, or a posed mastery question.
   const hasInlineCards =
     useInlineSegments &&
@@ -1010,14 +1100,14 @@ export const AssistantMessage = memo(function AssistantMessage({
         segments={segments}
         events={events}
         settled={processSettled}
-        language={language}
+        language={turnLanguage}
         isStreaming={isStreaming}
         readingMaterialId={readingMaterialId}
         readingMaterialRevision={readingMaterialRevision}
       />
     ),
     [
-      language,
+      turnLanguage,
       isStreaming,
       readingMaterialId,
       readingMaterialRevision,
@@ -1032,6 +1122,9 @@ export const AssistantMessage = memo(function AssistantMessage({
       ? t("{{count}} tool calls", { count: toolCalls })
       : undefined;
   }, [headerProcess, t]);
+
+  // A turn handed to a partner or an agent is theirs: the header shows them.
+  const answerer = useMemo(() => answererOf(events), [events]);
 
   const researchInProgress =
     outlineStatus === "researching" ||
@@ -1048,6 +1141,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           still working, collapsed once it settles into the final answer. */}
       <AssistantActivity
         events={events}
+        answerer={answerer}
         traceEvents={headerTraceEvents}
         isStreaming={isStreaming}
         content={msg.content}
@@ -1111,7 +1205,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           {showResearchBody ? (
             <AssistantResponse
               content={msg.content}
-              language={language}
+              language={turnLanguage}
               isStreaming={isStreaming}
               readingMaterialId={readingMaterialId}
               readingMaterialRevision={readingMaterialRevision}
@@ -1123,6 +1217,20 @@ export const AssistantMessage = memo(function AssistantMessage({
         <MathAnimatorViewer result={mathAnimatorResult} />
       ) : visualizeResult ? (
         <VisualizationViewer result={visualizeResult} />
+      ) : videoLessonResult ? (
+        <>
+          <VideoLessonViewer result={videoLessonResult} />
+          {msg.content ? (
+            <AssistantResponse
+              content={msg.content}
+              language={turnLanguage}
+              isStreaming={isStreaming}
+              readingMaterialId={readingMaterialId}
+              readingMaterialRevision={readingMaterialRevision}
+              events={events}
+            />
+          ) : null}
+        </>
       ) : quizQuestions && quizQuestions.length > 0 ? (
         <>
           {/* The quiz preface (the "I researched X, now let me quiz you on Y"
@@ -1137,7 +1245,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           {msg.content ? (
             <AssistantResponse
               content={msg.content}
-              language={language}
+              language={turnLanguage}
               isStreaming={isStreaming}
               readingMaterialId={readingMaterialId}
               readingMaterialRevision={readingMaterialRevision}
@@ -1170,18 +1278,22 @@ export const AssistantMessage = memo(function AssistantMessage({
               <div key={block.key}>
                 {renderMasteryCard(block.segment.question)}
               </div>
+            ) : block.segment.kind === "source_view" ? (
+              <MasterySourcePages key={block.key} pages={block.segment.pages} />
             ) : block.segment.kind === "ask_user" ? (
               <AskUserOptions
                 key={block.key}
                 data={block.segment.data}
                 onSubmit={submitReply}
               />
+            ) : block.segment.kind === "user_input" ? (
+              <SentMidTurn key={block.key} messages={block.segment.messages} />
             ) : null
           ) : block.segment.kind === "text" ? (
             <AssistantResponse
               key={block.key}
               content={block.segment.text}
-              language={language}
+              language={turnLanguage}
               isStreaming={isStreaming}
               readingMaterialId={readingMaterialId}
               readingMaterialRevision={readingMaterialRevision}
@@ -1192,7 +1304,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       ) : (
         <AssistantResponse
           content={body}
-          language={language}
+          language={turnLanguage}
           isStreaming={isStreaming}
           readingMaterialId={readingMaterialId}
           readingMaterialRevision={readingMaterialRevision}
@@ -1203,7 +1315,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         Array.isArray(event.metadata.sources) && event.metadata.sources.some(source =>
           source && typeof source === "object" &&
           (source.presentation === "teaching" || source.presentation === "reveal"))) &&
-        <MasterySourcePresentation events={events} />}
+        <MasterySourcePresentation events={events} placed={placedSourcePages} />}
       {/* Non-default branches (quiz, math animator, visualize) keep the
           card below the body. The default branch inlines it via
           ``messageSegments``; the research branch renders its own card
@@ -1222,9 +1334,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           replacing it, and applies to every branch. */}
       {setupCredential ? <SetupCredentialCard data={setupCredential} /> : null}
       {partnerDraft ? <PartnerDraftCard data={partnerDraft} /> : null}
-      {/* Course Study's hand-offs sit last: they are what to do *after* reading
-          the answer, so they belong below it rather than competing with it. */}
-      {courseHandoffs.length > 0 && <CourseHandoffCards handoffs={courseHandoffs} />}
+      {creationDraft ? <CreationDraftCard data={creationDraft} /> : null}
       {masteryHandoffs.length > 0 && <MasteryHandoffCards handoffs={masteryHandoffs} />}
     </>
   );
@@ -1337,180 +1447,6 @@ export function CopyActionButton({
   );
 }
 
-// Speaker button: synthesizes this one reply and plays it. Auto-play of later
-// replies is a Settings preference (`autoPlayFresh`), not a first-click prompt.
-let activePlayback: { owner: object; stop: () => void } | null = null;
-
-async function ttsErrorMessage(resp: Response): Promise<string> {
-  try {
-    const body = (await resp.json()) as { detail?: unknown };
-    if (typeof body.detail === "string" && body.detail.trim()) return body.detail;
-    if (Array.isArray(body.detail)) {
-      const first = body.detail[0] as { msg?: string } | undefined;
-      if (typeof first?.msg === "string" && first.msg.trim()) return first.msg;
-    }
-  } catch {
-    /* non-JSON error body */
-  }
-  return "";
-}
-
-export function PlayAudioButton({
-  content,
-  conversationKey,
-  autoPlayFresh,
-}: {
-  content: string;
-  conversationKey?: string;
-  autoPlayFresh: boolean;
-}) {
-  const { t } = useTranslation();
-  const { autoplayEnabled } = useVoiceAutoplay(conversationKey);
-  const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const urlRef = useRef<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const genRef = useRef(0);
-  const autoPlayedRef = useRef(false);
-  const playbackOwnerRef = useRef<object>({});
-
-  const cleanup = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (urlRef.current) {
-      URL.revokeObjectURL(urlRef.current);
-      urlRef.current = null;
-    }
-  }, []);
-
-  const stop = useCallback(() => {
-    genRef.current += 1;
-    cleanup();
-    setState("idle");
-    if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null;
-  }, [cleanup]);
-
-  const play = useCallback(async () => {
-    activePlayback?.stop();
-    const gen = ++genRef.current;
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-    activePlayback = { owner: playbackOwnerRef.current, stop };
-    setState("loading");
-    try {
-      const resp = await apiFetch(apiUrl("/api/voice/tts"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: content }),
-        signal: ac.signal,
-      });
-      if (gen !== genRef.current) return;
-      if (!resp.ok) {
-        const detail = await ttsErrorMessage(resp);
-        if (gen !== genRef.current) return;
-        notify(
-          t(detail || (resp.status === 504 ? SPEECH_TIMEOUT_MESSAGE : SPEECH_PLAYBACK_FAILURE_MESSAGE)),
-          { tone: "error" },
-        );
-        stop();
-        return;
-      }
-      const blob = await resp.blob();
-      if (gen !== genRef.current) return;
-      if (urlRef.current) {
-        URL.revokeObjectURL(urlRef.current);
-        urlRef.current = null;
-      }
-      const url = URL.createObjectURL(blob);
-      urlRef.current = url;
-      const audio = new Audio(url);
-      audioRef.current = audio;
-      audio.onended = () => {
-        if (gen !== genRef.current) return;
-        setState("idle");
-        cleanup();
-        if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null;
-      };
-      audio.onerror = () => {
-        if (gen !== genRef.current) return;
-        notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), {
-          tone: "error",
-        });
-        stop();
-      };
-      await audio.play();
-      if (gen !== genRef.current) {
-        audio.pause();
-        return;
-      }
-      setState("playing");
-    } catch (err) {
-      if (gen !== genRef.current) return;
-      if (err instanceof Error && err.name === "AbortError") return;
-      notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), {
-        tone: "error",
-      });
-      stop();
-    }
-  }, [cleanup, content, stop, t]);
-
-  const handleClick = useCallback(() => {
-    if (state === "playing" || state === "loading") {
-      stop();
-      return;
-    }
-    void play();
-  }, [play, state, stop]);
-
-  // Auto-play a freshly-generated reply when Settings auto-play is on.
-  useEffect(() => {
-    if (!autoPlayFresh || !autoplayEnabled) return;
-    if (autoPlayedRef.current) return;
-    if (!content.trim()) return;
-    autoPlayedRef.current = true;
-    const id = window.setTimeout(() => void play(), 0);
-    return () => window.clearTimeout(id);
-  }, [autoPlayFresh, autoplayEnabled, content, play]);
-
-  useEffect(() => () => {
-    genRef.current += 1;
-    cleanup();
-    if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null;
-  }, [cleanup]);
-
-  return (
-    <div className="relative inline-flex">
-      <Tooltip
-        label={state === "playing" ? t("Stop") : t("Play aloud")}
-        side="top"
-      >
-        <button
-          type="button"
-          onClick={handleClick}
-          aria-label={state === "playing" ? t("Stop") : t("Play aloud")}
-          className={`inline-flex items-center justify-center rounded-md p-1 transition-colors ${
-            state === "playing"
-              ? "text-[var(--primary)]"
-              : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/50 hover:text-[var(--foreground)]"
-          }`}
-        >
-          {state === "loading" ? (
-            <Loader2 size={15} strokeWidth={1.8} className="animate-spin" />
-          ) : state === "playing" ? (
-            <Square size={13} strokeWidth={1.8} className="fill-current" />
-          ) : (
-            <Volume2 size={15} strokeWidth={1.5} />
-          )}
-        </button>
-      </Tooltip>
-    </div>
-  );
-}
 
 function BranchNavigator({
   info,
@@ -1704,6 +1640,7 @@ export const UserMessage = memo(function UserMessage({
   // snapshot's Space references — rendered as one collapsed tree under
   // the bubble (the sent-message mirror of the composer's tree).
   const snap = msg.requestSnapshot;
+  const handedTo = parseAnswerBy(snap?.config?.answer_by);
   const refTreeItems: ContextTreeItem[] = [
     ...(consultation ? [{
       key: `${consultation.kind}-${consultation.id}`,
@@ -1712,7 +1649,7 @@ export const UserMessage = memo(function UserMessage({
       label: consultation.name,
       onClick: onOpenConsultation,
     }] : []),
-    ...(msg.attachments ?? []).map((a, ai): ContextTreeItem => {
+    ...(msg.attachments ?? []).filter((a) => !isQuoteAttachment(a)).map((a, ai): ContextTreeItem => {
       const filename = a.filename || t("Attachment");
       const spec = docIconFor(filename);
       const src = a.type === "image" ? imageSrcForAttachment(a) : null;
@@ -1825,13 +1762,15 @@ export const UserMessage = memo(function UserMessage({
         data-turn-key={turnAnchorKey(msg, index)}
         className="flex max-w-[75%] flex-col items-end gap-1.5"
       >
-        {showModeBadge && (
+        {handedTo ? (
+          <HandedToBadge kind={handedTo.kind} id={handedTo.id} agentKind={agentKinds[handedTo.id]} />
+        ) : showModeBadge ? (
           <div className="flex justify-end pr-1">
             <span className="text-[10px] tracking-wide text-[var(--muted-foreground)]">
               {t(getModeBadgeLabel(msg.capability))}
             </span>
           </div>
-        )}
+        ) : null}
         {editing ? (
           <div className="w-[min(620px,75vw)] rounded-2xl border border-[var(--primary)]/40 bg-[var(--secondary)] px-3 py-2.5 text-[14px] leading-relaxed text-[var(--foreground)] shadow-sm">
             <textarea
@@ -1900,7 +1839,15 @@ export const UserMessage = memo(function UserMessage({
                 }
               />
             ) : null}
-            <div className="whitespace-pre-wrap">{msg.content}</div>
+            {(msg.attachments ?? []).filter(isQuoteAttachment).map((a, qi) => (
+              <div
+                key={`quote-${qi}`}
+                className={`mb-1.5 line-clamp-3 whitespace-pre-line ${QUOTE_RULE_CLASS}`}
+              >
+                {quoteText(a)}
+              </div>
+            ))}
+            <div dir="auto" className="whitespace-pre-wrap"><LearningText size={14}>{msg.content}</LearningText></div>
           </div>
         )}
         {/* Recovery records are local to this browser. Keep their actions
@@ -1912,7 +1859,8 @@ export const UserMessage = memo(function UserMessage({
           >
             <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />
             {t("Not sent")}
-            {onRetryFailedSubmission && !msg.failedSubmissionNeedsReview && typeof msg.id === "number" && (
+            {onRetryFailedSubmission && !msg.failedSubmissionNeedsReview &&
+              typeof msg.id === "number" && (
               <button type="button" disabled={editDisabled || retrying} onClick={async () => {
                 if (retrying || typeof msg.id !== "number") return;
                 setRetrying(true);
@@ -1985,8 +1933,7 @@ UserMessage.displayName = "UserMessage";
  */
 function ReadingPassageQuote({ quote, href }: { quote: string; href?: string }) {
   const { t } = useTranslation();
-  const className =
-    "mb-1.5 block border-l-2 border-[color-mix(in_srgb,var(--primary)_45%,transparent)] pl-2.5 text-[12.5px] leading-relaxed text-[var(--muted-foreground)]";
+  const className = `mb-1.5 block ${QUOTE_RULE_CLASS}`;
   const text = <span className="line-clamp-3">{quote}</span>;
   return href ? (
     <a
@@ -2010,6 +1957,7 @@ export const ChatMessageList = memo(function ChatMessageList({
   onRegenerateMessage,
   canResendLastTurn = false,
   onResendLastTurn,
+  onRetryTurn,
   onConfirmOutline,
   onPreviewAttachment,
   onOpenConsultation,
@@ -2028,6 +1976,12 @@ export const ChatMessageList = memo(function ChatMessageList({
   showModeBadge = true,
   onLoadMessageTrace,
   onReleaseMessageTrace,
+  assistantActions,
+  compactActions = false,
+  threadsByMessageId,
+  onOpenThread,
+  onDeleteThread,
+  onDetachThread,
 }: {
   messages: ChatMessageItem[];
   isStreaming: boolean;
@@ -2039,6 +1993,8 @@ export const ChatMessageList = memo(function ChatMessageList({
    *  stopped. Drives the Resend affordance on the trailing assistant. */
   canResendLastTurn?: boolean;
   onResendLastTurn?: () => void;
+  /** Take a finished turn back into the composer to edit and send again. */
+  onRetryTurn?: (userMessage: ChatMessageItem) => void;
   onConfirmOutline?: (
     outline: Array<{ title: string; overview: string }>,
     topic: string,
@@ -2096,8 +2052,28 @@ export const ChatMessageList = memo(function ChatMessageList({
   showModeBadge?: boolean;
   onLoadMessageTrace?: (messageId: number) => Promise<void>;
   onReleaseMessageTrace?: (messageId: number) => void;
+  /** A surface's own actions on a finished reply, after the shared ones —
+   *  the note companion's "add to the page" lives here. */
+  assistantActions?: (message: ChatMessageItem) => ReactNode;
+  /** A narrow side surface keeps only copy, regenerate and its own actions:
+   *  read-aloud, delete and the usage line belong to the full chat. */
+  compactActions?: boolean;
+  /** Little Tutor threads opened from a message, keyed by that message id
+   *  (``String(message.id)`` so SQLite and PocketBase ids group alike).
+   *  Omitted where the surface has no message-level thread entry point. */
+  threadsByMessageId?: ReadonlyMap<string, SessionSummary[]>;
+  onOpenThread?: (thread: SessionSummary) => void;
+  onDeleteThread?: (thread: SessionSummary) => Promise<void>;
+  /** Detach a thread from this message without deleting its conversation. */
+  onDetachThread?: (thread: SessionSummary) => Promise<void>;
 }) {
   const { t } = useTranslation();
+  // One lookup for both bubbles; the map is memoized by the chat page, so a
+  // message without threads costs a miss and no render branch.
+  const threadsForMessage = (messageId?: number) =>
+    messageId != null && threadsByMessageId
+      ? threadsByMessageId.get(String(messageId))
+      : undefined;
   // Visible path: when no branching has happened the result is identical
   // to the input. After an edit, sibling branches are filtered out so the
   // UI shows exactly one continuous thread, with arrow nav exposed on the
@@ -2297,6 +2273,10 @@ export const ChatMessageList = memo(function ChatMessageList({
     }
   }
 
+  const { rate: voiceRate, setRate: setVoiceRate } = useVoicePlaybackRate(
+    sessionId ? JSON.stringify([activeWorkspaceId(), sessionId]) : undefined,
+  );
+
   return (
     <>
       {messageRows.map(({ msg, originalIndex, pairedUserMessage }, rowIndex) => {
@@ -2359,6 +2339,18 @@ export const ChatMessageList = memo(function ChatMessageList({
                   ) : null}
                 </div>
               ) : null}
+              {(() => {
+                const threads = threadsForMessage(msg.id);
+                return threads?.length && onOpenThread && onDeleteThread ? (
+                  <MessageThreadMarker
+                    threads={threads}
+                    align="right"
+                    onOpen={onOpenThread}
+                    onDelete={onDeleteThread}
+                    onDetach={onDetachThread}
+                  />
+                ) : null;
+              })()}
             </div>
           );
         }
@@ -2396,6 +2388,16 @@ export const ChatMessageList = memo(function ChatMessageList({
           canResendLastTurn &&
           Boolean(pairedUserMessage?.requestSnapshot) &&
           Boolean(onResendLastTurn);
+        // Retry takes a turn the server has saved: its new attempt is a
+        // sibling of this one, under the same parent.
+        const retryTarget =
+          onRetryTurn &&
+          (showRegenerate || showResend) &&
+          pairedUserMessage?.id != null &&
+          pairedUserMessage.id > 0 &&
+          !pairedUserMessage.failedSubmission
+            ? pairedUserMessage
+            : null;
         const deletableTurnUserId =
           msgDone && pairedUserMessage?.id != null && onDeleteTurn
             ? pairedUserMessage.id
@@ -2439,6 +2441,7 @@ export const ChatMessageList = memo(function ChatMessageList({
             <GeneratedFileCards
               attachments={msg.attachments ?? []}
               events={msg.events}
+              content={msg.content}
               onOpen={onPreviewAttachment}
             />
             {(() => {
@@ -2485,50 +2488,90 @@ export const ChatMessageList = memo(function ChatMessageList({
             {(showActions || costSummary || showDelete) && (
               <div className="mt-3 flex items-center">
                 {(showActions || showDelete) && (
-                  <div className="flex items-center gap-1">
+                  <div className="flex shrink-0 items-center gap-1">
                     {showActions && (
                       <CopyActionButton
                         content={msg.content}
                         onCopy={onCopyAssistantMessage}
                       />
                     )}
-                    {showActions && (
-                      <PlayAudioButton
-                        content={msg.content}
-                        conversationKey={sessionId ?? undefined}
-                        autoPlayFresh={
-                          isLastAssistant && freshlyCompletedIndex === i
-                        }
-                      />
+                    {showActions && !compactActions && (
+                      <>
+                        <PlayAudioButton
+                          playbackRate={voiceRate}
+                          content={msg.content}
+                          conversationKey={sessionId ?? undefined}
+                          autoPlayFresh={
+                            isLastAssistant && freshlyCompletedIndex === i
+                          }
+                        />
+                        {i === lastRenderedAssistantIndex && (
+                          <select
+                            aria-label={t("Playback speed")}
+                            className="rounded bg-transparent px-1 text-xs text-[var(--muted-foreground)]"
+                            value={voiceRate}
+                            onChange={(event) => setVoiceRate(Number(event.target.value))}
+                          >
+                            {VOICE_PLAYBACK_RATES.map((rate) => (
+                              <option key={rate} value={rate}>{rate}×</option>
+                            ))}
+                          </select>
+                        )}
+                      </>
                     )}
-                    {showActions && showRegenerate && (
+                    {/* One way to try a turn again. Where the surface can
+                        take the turn back into its composer, Retry does that
+                        and the learner edits before sending; elsewhere it
+                        reruns the turn as it was. Regenerate and Resend were
+                        two identical icons offered side by side. */}
+                    {retryTarget ? (
+                      <RoughActionButton
+                        icon={RotateCcw}
+                        label={t("Retry")}
+                        onClick={() => onRetryTurn?.(retryTarget)}
+                      />
+                    ) : showActions && showRegenerate ? (
                       <RoughActionButton
                         icon={RefreshCcw}
                         label={t("Regenerate")}
                         onClick={() => onRegenerateMessage()}
                       />
-                    )}
-                    {showResend && (
+                    ) : showResend ? (
                       <RoughActionButton
                         icon={RefreshCcw}
                         label={t("Resend")}
                         onClick={() => onResendLastTurn?.()}
                       />
-                    )}
-                    {showDelete && (
+                    ) : null}
+                    {showDelete && !compactActions && (
                       <DeleteTurnButton
                         onDelete={() => onDeleteTurn?.(deletableTurnUserId)}
                       />
                     )}
+                    {showActions && assistantActions?.(msg)}
                   </div>
                 )}
-                {costSummary && (
-                  <div className="ml-auto">
+                {costSummary && !compactActions && (
+                  // The room left beside the actions is what the usage pill
+                  // measures itself against (see UsageFooter).
+                  <div className="flex min-w-0 flex-1 justify-end pl-2 [container-type:inline-size]">
                     <UsageFooter turn={costSummary} session={usageByRow.get(i) ?? costSummary} />
                   </div>
                 )}
               </div>
             )}
+            {(() => {
+              const threads = threadsForMessage(msg.id);
+              return threads?.length && onOpenThread && onDeleteThread ? (
+                <MessageThreadMarker
+                  threads={threads}
+                  align="left"
+                  onOpen={onOpenThread}
+                  onDelete={onDeleteThread}
+                  onDetach={onDetachThread}
+                />
+              ) : null;
+            })()}
           </div>
         );
       })}
@@ -2537,3 +2580,24 @@ export const ChatMessageList = memo(function ChatMessageList({
 });
 
 ChatMessageList.displayName = "ChatMessageList";
+
+/** Above a message handed to someone: their mark and "Handed to <name>". */
+function HandedToBadge({
+  kind,
+  id,
+  agentKind,
+}: {
+  kind: "partner" | "subagent";
+  id: string;
+  agentKind?: string;
+}) {
+  const { t } = useTranslation();
+  const partner = usePartner(kind === "partner" ? id : null);
+  const name = partner?.name ?? id;
+  return (
+    <div className="flex items-center justify-end gap-1.5 pr-1 text-[11px] text-[var(--muted-foreground)]">
+      <AnswererMark answerer={{ kind, id, name, agent: agentKind }} size={14} />
+      <span>{t("trace.answerer.handedTo", { name })}</span>
+    </div>
+  );
+}

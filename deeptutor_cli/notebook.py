@@ -29,7 +29,7 @@ def register(app: typer.Typer) -> None:
 
         client = DeepTutorApp()
         notebook = client.create_notebook(name=name, description=description)
-        console.print(json.dumps(notebook, ensure_ascii=False, indent=2, default=str))
+        console.print_json(json.dumps(notebook, ensure_ascii=False, default=str))
 
     @app.command("show")
     def show_notebook(
@@ -51,7 +51,7 @@ def register(app: typer.Typer) -> None:
             console.print(f"[red]Notebook not found:[/] {notebook_id}")
             raise typer.Exit(code=1)
         if fmt == "json":
-            console.print(json.dumps(notebook, ensure_ascii=False, indent=2, default=str))
+            console.print_json(json.dumps(notebook, ensure_ascii=False, default=str))
             return
         console.print(f"[bold]{notebook.get('name', '')}[/] ({notebook.get('id', '')})")
         console.print(str(notebook.get("description", "") or ""))
@@ -99,7 +99,9 @@ def register(app: typer.Typer) -> None:
             console.print(f"[red]File not found:[/] {file_path}")
             raise typer.Exit(code=1)
 
-        content = path.read_text(encoding="utf-8")
+        from deeptutor.utils.file_types import FileTypeRouter
+
+        content = FileTypeRouter.decode_bytes(path.read_bytes())
         record_title = title or path.stem
 
         from deeptutor.app import DeepTutorApp
@@ -130,9 +132,10 @@ def register(app: typer.Typer) -> None:
             console.print(f"[red]File not found:[/] {file_path}")
             raise typer.Exit(code=1)
 
-        content = path.read_text(encoding="utf-8")
-
         from deeptutor.app import DeepTutorApp
+        from deeptutor.utils.file_types import FileTypeRouter
+
+        content = FileTypeRouter.decode_bytes(path.read_bytes())
 
         client = DeepTutorApp()
         updated = client.update_record(notebook_id, record_id, output=content)

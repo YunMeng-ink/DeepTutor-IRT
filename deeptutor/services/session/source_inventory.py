@@ -34,7 +34,6 @@ import hashlib
 import logging
 from typing import Any, Sequence
 
-from deeptutor.reading.references import resolve_reading_sources
 from deeptutor.services.session.protocol import SessionStoreProtocol
 
 logger = logging.getLogger(__name__)
@@ -725,6 +724,10 @@ async def collect_prior_image_attachments(
     re-attaches the result (URL-only; the multimodal layer resolves the bytes
     from the attachment store at request time). Text attachments are not
     collected here: they are re-served by the inventory's own historical walk.
+
+    Each record is marked ``historical=True`` with the originating
+    ``source_message_id`` (#2632) so the multimodal assembly can tell the
+    model these images came from earlier messages, not the current one.
     """
     if limit is None:
         from deeptutor.services.config import get_prior_image_reinject_limit
@@ -755,6 +758,8 @@ async def collect_prior_image_attachments(
                     "base64": "",
                     "filename": str(att.get("filename", "") or ""),
                     "mime_type": str(att.get("mime_type", "") or ""),
+                    "historical": True,
+                    "source_message_id": str(msg.get("id", "") or ""),
                 }
             )
             if len(collected) >= limit:
@@ -778,6 +783,14 @@ def _add_reading_sources(
     preserves user isolation and makes a deleted material disappear from later
     turns instead of leaving a stale or spoofable copy in session metadata.
     """
+
+    if not references:
+        return
+    from deeptutor.modules.catalog import module_enabled
+
+    if not module_enabled("reading"):
+        return
+    from deeptutor.reading.references import resolve_reading_sources
 
     for source in resolve_reading_sources(list(references)):
         if source.source_id in inv and not fresh:
@@ -821,6 +834,10 @@ def _resolve_book_section(book_reference: dict[str, Any]) -> tuple[str, str]:
     reference is rendered independently (so the per-book ``bk-{book_id}``
     source id stays stable). Returns ``("", "")`` on failure.
     """
+    from deeptutor.modules.catalog import module_enabled
+
+    if not module_enabled("books"):
+        return "", ""
     from deeptutor.book.context import build_book_context
 
     try:

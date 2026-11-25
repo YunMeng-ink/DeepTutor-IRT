@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import pytest
@@ -70,12 +71,12 @@ async def test_complete_merges_config_and_caller_extra_headers(monkeypatch) -> N
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
 
-    def _fake_get_runtime_provider(config: LLMConfig):
+    def _fake_acquire_runtime_provider(config: LLMConfig):
         captured_config["config"] = config
-        return provider
+        return nullcontext(provider)
 
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider", _fake_get_runtime_provider
+        "deeptutor.services.llm.factory.acquire_runtime_provider", _fake_acquire_runtime_provider
     )
 
     result = await complete("hello", extra_headers={"X-Caller": "from-caller"})
@@ -92,8 +93,8 @@ async def test_complete_honors_explicit_image_fallback_override(monkeypatch) -> 
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     assert await complete("hello", allow_image_fallback=False) == "ok"
@@ -108,12 +109,12 @@ async def test_stream_merges_config_and_caller_extra_headers(monkeypatch) -> Non
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
 
-    def _fake_get_runtime_provider(config: LLMConfig):
+    def _fake_acquire_runtime_provider(config: LLMConfig):
         captured_config["config"] = config
-        return provider
+        return nullcontext(provider)
 
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider", _fake_get_runtime_provider
+        "deeptutor.services.llm.factory.acquire_runtime_provider", _fake_acquire_runtime_provider
     )
 
     chunks = []
@@ -138,12 +139,12 @@ async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
 
-    def _fake_get_runtime_provider(config: LLMConfig):
+    def _fake_acquire_runtime_provider(config: LLMConfig):
         captured_config["config"] = config
-        return provider
+        return nullcontext(provider)
 
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider", _fake_get_runtime_provider
+        "deeptutor.services.llm.factory.acquire_runtime_provider", _fake_acquire_runtime_provider
     )
 
     result = await complete(
@@ -211,8 +212,8 @@ async def test_stream_does_not_replay_reasoning_as_final_content(monkeypatch) ->
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     chunks = []
@@ -234,8 +235,8 @@ async def test_complete_does_not_return_duplicated_reasoning_as_content(monkeypa
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     assert await complete("hello") == ""
@@ -248,8 +249,8 @@ async def test_complete_injects_openai_image_parts(monkeypatch) -> None:
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     result = await complete(
@@ -277,8 +278,8 @@ async def test_complete_injects_anthropic_image_parts(monkeypatch) -> None:
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     result = await complete(
@@ -305,8 +306,8 @@ async def test_complete_injects_custom_anthropic_image_parts(monkeypatch) -> Non
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     result = await complete(
@@ -333,8 +334,8 @@ async def test_complete_strips_unsupported_response_format(monkeypatch) -> None:
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     result = await complete(
@@ -353,8 +354,8 @@ async def test_complete_passes_retry_delays(monkeypatch) -> None:
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     await complete("hello", max_retries=3, retry_delay=0.5, exponential_backoff=True)
@@ -373,8 +374,8 @@ async def test_stream_raises_when_provider_reports_error_before_any_output(monke
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     chunks = []
@@ -398,8 +399,8 @@ async def test_stream_keeps_delivered_output_when_provider_reports_error_late(
 
     monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
     monkeypatch.setattr(
-        "deeptutor.services.llm.factory.get_runtime_provider",
-        lambda _config: provider,
+        "deeptutor.services.llm.factory.acquire_runtime_provider",
+        lambda _config: nullcontext(provider),
     )
 
     chunks = []

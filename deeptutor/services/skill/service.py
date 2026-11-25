@@ -482,11 +482,13 @@ class SkillService:
         if resolved is None:
             raise SkillNotFoundError(name)
         skill_dir, _source = resolved
+        # POSIX form, sorted as text: the model asks for files the way SKILL.md
+        # links them ("references/outline.md"), whatever the server's OS.
         files: list[str] = []
-        for path in sorted(skill_dir.rglob("*")):
+        for path in skill_dir.rglob("*"):
             if path.is_file() and not path.name.startswith("."):
-                files.append(str(path.relative_to(skill_dir)))
-        return files
+                files.append(path.relative_to(skill_dir).as_posix())
+        return sorted(files)
 
     # ── runtime loading (manifest + always) ─────────────────────────────
 
@@ -1045,8 +1047,8 @@ def get_admin_skill_service() -> SkillService:
 
 
 def get_skill_service() -> SkillService:
+    from deeptutor.core.identities import is_partner_user_id
     from deeptutor.multi_user.context import get_current_user
-    from deeptutor.services.partners.scope import is_partner_user_id
     from deeptutor.services.workspace import get_content_workspace_service
 
     root = (

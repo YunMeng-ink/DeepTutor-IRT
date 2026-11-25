@@ -656,42 +656,28 @@ def test_set_rag_provider_mode_persists_validates_and_reflects() -> None:
         )
 
 
-def test_supported_file_types_returns_upload_policy() -> None:
+def test_supported_file_types_returns_upload_policy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        knowledge_router_module.FileTypeRouter,
+        "accepted_upload_extensions",
+        classmethod(lambda cls: {".pdf", ".md", ".docx"}),
+    )
     with TestClient(_build_app()) as client:
         response = client.get("/api/knowledge-bases/supported-file-types")
-
     assert response.status_code == 200
     payload = response.json()
-    assert ".pdf" in payload["extensions"]
-    assert ".docx" in payload["extensions"]
-    assert ".xlsx" in payload["extensions"]
-    assert ".pptx" in payload["extensions"]
-    assert ".md" in payload["extensions"]
-    assert ".png" in payload["extensions"]
-    assert ".pages" in payload["extensions"]
-    assert ".mp4" in payload["extensions"]
-    assert ".dclg.xml" in payload["extensions"]
-    assert ".tar.gz" in payload["extensions"]
-    assert ".ipynb" in payload["extensions"]
-    assert ".cbz" in payload["extensions"]
-    assert ".key" in payload["extensions"]
-    assert ".vsdx" in payload["extensions"]
-    assert ".sqlite3" in payload["extensions"]
+    assert payload["extensions"] == [".docx", ".md", ".pdf"]
     assert payload["max_file_size_bytes"] > 0
-    assert "max_pdf_size_bytes" not in payload
     assert ".pdf" in payload["accept"]
-    assert ".docx" in payload["accept"]
-    assert ".png" in payload["accept"]
-    assert ".tar.gz" in payload["accept"]
-    assert "image/png" in payload["accept"]
+    assert ".doc" not in payload["extensions"]
     assert payload["allow_any_extension"] is False
 
 
 def test_supported_file_types_can_delegate_all_extensions(monkeypatch) -> None:
     monkeypatch.setattr(
         knowledge_router_module.FileTypeRouter,
-        "active_parser_accepts_any_format",
-        classmethod(lambda cls: True),
+        "accepted_upload_extensions",
+        classmethod(lambda cls: set()),
     )
 
     with TestClient(_build_app()) as client:
@@ -3481,3 +3467,38 @@ async def test_health_counts_registry_without_constructing_index_manager(tmp_pat
     result = await knowledge_router_module.health_check()
     assert result["status"] == "ok"
     assert result["knowledge_bases_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/knowledge-bases/missing-kb"),
+        ("DELETE", "/api/knowledge-bases/missing-kb"),
+        ("PUT", "/api/knowledge-bases/default/missing-kb"),
+        ("GET", "/api/knowledge-bases/missing-kb/progress"),
+        ("POST", "/api/knowledge-bases/missing-kb/progress/clear"),
+        ("POST", "/api/knowledge-bases/missing-kb/reindex"),
+        ("POST", "/api/knowledge-bases/missing-kb/retry"),
+        ("GET", "/api/knowledge-bases/missing-kb/linked-folders"),
+        ("DELETE", "/api/knowledge-bases/missing-kb/linked-folders/x"),
+        ("POST", "/api/knowledge-bases/missing-kb/sync-folder/x"),
+        ("GET", "/api/knowledge-bases/missing-kb/github-sources"),
+        ("DELETE", "/api/knowledge-bases/missing-kb/github-source/x"),
+        ("POST", "/api/knowledge-bases/missing-kb/sync-github"),
+        ("GET", "/api/knowledge-bases/missing-kb/web-sources"),
+        ("GET", "/api/knowledge-bases/missing-kb/web-source-sync"),
+        ("DELETE", "/api/knowledge-bases/missing-kb/web-source/x"),
+        ("POST", "/api/knowledge-bases/missing-kb/web-source/x/cancel"),
+        ("GET", "/api/knowledge-bases/missing-kb/web-source/x/pairings"),
+        ("POST", "/api/knowledge-bases/missing-kb/web-source/x/retry"),
+        ("POST", "/api/knowledge-bases/missing-kb/sync-web"),
+    ],
+)
+def test_missing_kb_returns_404_instead_of_500(method: str, path: str) -> None:
+    """The resolver raises ``AccessError``; the routes' re-raise guards must let it
+    reach the app handler instead of their ``except Exception`` turning it into 500."""
+    from deeptutor.api.main import app
+
+    response = TestClient(app, raise_server_exceptions=False).request(method, path, json={})
+
+    assert response.status_code == 404, response.text

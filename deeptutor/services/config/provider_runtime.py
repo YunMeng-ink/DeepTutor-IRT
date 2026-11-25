@@ -91,7 +91,11 @@ SEARCH_PROVIDERS: dict[str, SearchProviderSpec] = {
     "tavily": SearchProviderSpec(label="Tavily", requires_api_key=True, supports_answer=True),
     "jina": SearchProviderSpec(label="Jina", requires_api_key=True),
     "searxng": SearchProviderSpec(label="SearXNG", requires_base_url=True),
+    "google_browser_scraper": SearchProviderSpec(
+        label="Google Browser Scraper", requires_base_url=True
+    ),
     "duckduckgo": SearchProviderSpec(label="DuckDuckGo"),
+    "you": SearchProviderSpec(label="You.com", requires_api_key=True),
     "perplexity": SearchProviderSpec(
         label="Perplexity",
         requires_api_key=True,
@@ -100,6 +104,7 @@ SEARCH_PROVIDERS: dict[str, SearchProviderSpec] = {
     ),
     "serper": SearchProviderSpec(label="Serper", requires_api_key=True, soft_fallback=False),
     "serply": SearchProviderSpec(label="Serply", requires_api_key=True, soft_fallback=False),
+    "searchapi": SearchProviderSpec(label="SearchApi", requires_api_key=True, soft_fallback=False),
     "firecrawl": SearchProviderSpec(label="Firecrawl", requires_api_key=True, soft_fallback=False),
     # China-hosted engines. Doubao is the one that writes its own answer: Ark
     # exposes web search only as a tool on a Doubao model, never standalone.
@@ -116,6 +121,15 @@ SEARCH_PROVIDERS: dict[str, SearchProviderSpec] = {
     ),
     "aliyun_iqs": SearchProviderSpec(
         label="Aliyun IQS", requires_api_key=True, soft_fallback=False
+    ),
+    # DeepSeek's standalone SERP engine (``POST /v1/tools/search``) — usable
+    # with any chat LLM, unlike the model-side web_search tool mapping.
+    "deepseek": SearchProviderSpec(label="DeepSeek", requires_api_key=True, soft_fallback=False),
+    "specstream": SearchProviderSpec(
+        label="SpecStream",
+        requires_api_key=True,
+        soft_fallback=False,
+        supports_answer=True,
     ),
 }
 
@@ -134,6 +148,49 @@ def search_provider_spec(provider: str | None) -> SearchProviderSpec | None:
 def supported_search_providers_hint() -> str:
     """Human-readable provider list for error messages and CLI output."""
     return ", ".join(name for name in SEARCH_PROVIDERS if name != "none")
+
+
+@dataclass(frozen=True)
+class FetchProviderSpec:
+    """Single web-fetch-backend metadata entry.
+
+    Companion to :class:`SearchProviderSpec` for the ``web_fetch`` fetch
+    backend (issue #2448). ``local`` is the in-process httpx GET +
+    readability extractor and the default for every install; a remote
+    backend replaces the HTTP+extract step only — the scheme/SSRF gate in
+    ``deeptutor/tools/web_fetch.py`` always runs before any backend is
+    contacted, so a private URL is never handed to a third party.
+
+    The fetch registry (``deeptutor/services/fetch/providers``) derives its
+    adapter metadata from this table, mirroring how the search registry
+    derives from ``SEARCH_PROVIDERS``.
+    """
+
+    label: str
+    requires_api_key: bool = False
+    requires_base_url: bool = False
+
+
+# Insertion order is the Settings dropdown order.
+FETCH_PROVIDERS: dict[str, FetchProviderSpec] = {
+    "local": FetchProviderSpec(label="Local"),
+    "deepseek": FetchProviderSpec(label="DeepSeek Fetch", requires_api_key=True),
+}
+
+# The credential-free backend every unconfigured install keeps using.
+DEFAULT_FETCH_PROVIDER = "local"
+
+SUPPORTED_FETCH_PROVIDERS = frozenset(FETCH_PROVIDERS)
+
+
+def fetch_provider_spec(provider: str | None) -> FetchProviderSpec | None:
+    """Look up a fetch backend's spec, or ``None`` for unknown names."""
+    return FETCH_PROVIDERS.get((provider or "").strip().lower())
+
+
+def supported_fetch_providers_hint() -> str:
+    """Human-readable fetch-backend list for error messages and CLI output."""
+    return ", ".join(FETCH_PROVIDERS)
 
 
 LLM_LOCALHOST_PROVIDERS = ("ollama", "vllm")
@@ -165,6 +222,15 @@ class EmbeddingProviderSpec:
 
 
 EMBEDDING_PROVIDERS: dict[str, EmbeddingProviderSpec] = {
+    "nvidia_nim": EmbeddingProviderSpec(
+        label="NVIDIA NIM",
+        adapter="nvidia_nim",
+        default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["nvidia_nim"],
+        keywords=(),
+        is_local=False,
+        default_model="nvidia/nemotron-3.5-embed-8b",
+        default_dim=4096,
+    ),
     "openai": EmbeddingProviderSpec(
         label="OpenAI",
         default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["openai"],
@@ -172,6 +238,15 @@ EMBEDDING_PROVIDERS: dict[str, EmbeddingProviderSpec] = {
         is_local=False,
         default_model="text-embedding-3-large",
         default_dim=3072,
+    ),
+    "mistral": EmbeddingProviderSpec(
+        label="Mistral",
+        adapter="openai_compat",
+        default_api_base=EMBEDDING_PROVIDER_DEFAULT_ENDPOINTS["mistral"],
+        keywords=("mistral", "mistral-embed", "codestral-embed"),
+        is_local=False,
+        default_model="mistral-embed",
+        default_dim=1024,
     ),
     "gemini": EmbeddingProviderSpec(
         label="Gemini",
@@ -350,6 +425,19 @@ TTS_PROVIDERS: dict[str, VoiceProviderSpec] = {
         default_api_base="https://api.openai.com/v1",
         default_model="gpt-4o-mini-tts",
     ),
+    "mistral": VoiceProviderSpec(
+        label="Mistral (Voxtral TTS)",
+        default_api_base="https://api.mistral.ai/v1",
+        adapter="mistral_tts",
+        default_model="voxtral-mini-tts-2603",
+    ),
+    "xai": VoiceProviderSpec(
+        label="xAI (Grok Voice)",
+        default_api_base="https://api.x.ai/v1",
+        adapter="xai_tts",
+        default_model="grok-tts",
+        default_voice="eve",
+    ),
     # Gemini TTS only speaks the native generateContent audio API, never the
     # OpenAI-compatible /audio/speech endpoint, so it gets its own adapter.
     "gemini": VoiceProviderSpec(
@@ -391,6 +479,15 @@ TTS_PROVIDERS: dict[str, VoiceProviderSpec] = {
         default_api_base="",
         default_model="",
     ),
+    # Edge's free read-aloud voices via the edge-tts package; no key, no endpoint.
+    "edge": VoiceProviderSpec(
+        label="Microsoft Edge (free)",
+        default_api_base="",
+        adapter="edge",
+        default_model="edge-tts",
+        default_voice="zh-CN-XiaoxiaoNeural",
+        is_local=True,
+    ),
 }
 
 STT_PROVIDERS: dict[str, VoiceProviderSpec] = {
@@ -413,6 +510,18 @@ STT_PROVIDERS: dict[str, VoiceProviderSpec] = {
         label="OpenAI",
         default_api_base="https://api.openai.com/v1",
         default_model="gpt-4o-mini-transcribe",
+    ),
+    "mistral": VoiceProviderSpec(
+        label="Mistral (Voxtral)",
+        default_api_base="https://api.mistral.ai/v1",
+        adapter="mistral_stt",
+        default_model="voxtral-mini-latest",
+    ),
+    "xai": VoiceProviderSpec(
+        label="xAI (Grok Voice)",
+        default_api_base="https://api.x.ai/v1",
+        adapter="xai_stt",
+        default_model="grok-voice-transcribe-2.0",
     ),
     "openrouter": VoiceProviderSpec(
         label="OpenRouter",
@@ -459,6 +568,9 @@ VOICE_PROVIDER_ALIASES = {
     "aoai": "azure_openai",
     "openai_compatible": "custom",
     "lmstudio": "vllm",
+    "voxtral": "mistral",
+    "x_ai": "xai",
+    "grok": "xai",
 }
 
 
@@ -501,6 +613,11 @@ IMAGEGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
         label="OpenAI",
         default_api_base="https://api.openai.com/v1",
         default_model="gpt-image-1",
+    ),
+    "xai": GenerationProviderSpec(
+        label="xAI (Grok Imagine)",
+        default_api_base="https://api.x.ai/v1",
+        default_model="grok-imagine-image-2.0",
     ),
     "volcengine": GenerationProviderSpec(
         label="Volcengine Ark (Seedream)",
@@ -555,6 +672,12 @@ VIDEOGEN_PROVIDERS: dict[str, GenerationProviderSpec] = {
         adapter="async_task",
         default_model="doubao-seedance-1-0-pro-250528",
     ),
+    "xai": GenerationProviderSpec(
+        label="xAI (Grok Imagine Video)",
+        default_api_base="https://api.x.ai/v1",
+        adapter="xai",
+        default_model="grok-imagine-video-1.5",
+    ),
     "custom": GenerationProviderSpec(
         label="Async Task (Custom)",
         default_api_base="",
@@ -575,6 +698,8 @@ GENERATION_PROVIDER_ALIASES = {
     "azure": "azure_openai",
     "aoai": "azure_openai",
     "openai_compatible": "custom",
+    "x_ai": "xai",
+    "grok": "xai",
 }
 
 
@@ -651,6 +776,9 @@ class ResolvedSearchConfig:
     base_url: str = ""
     max_results: int = 5
     proxy: str | None = None
+    # Engine the active profile pins, consumed by providers whose API has one
+    # (Zhipu). ``None`` lets each provider use its own default.
+    search_engine: str | None = None
     unsupported_provider: bool = False
     deprecated_provider: bool = False
     missing_credentials: bool = False
@@ -1440,6 +1568,33 @@ def _resolve_search_max_results(catalog: dict[str, Any], default: int = 5) -> in
         return default
 
 
+def _resolve_search_engine(catalog: dict[str, Any]) -> str | None:
+    """Engine the active search profile pins, for providers that take one.
+
+    Mirrors :func:`_resolve_search_max_results`: the active search profile
+    wins, then ``tools.web_search`` in main.yaml. Only the value is resolved
+    here -- validating it is the provider's job, since only it knows which
+    engines its API accepts.
+    """
+    profile = get_model_catalog_service().get_active_profile(catalog, "search") or {}
+    for key in ("search_engine", "engine"):
+        raw = _as_str(profile.get(key))
+        if raw:
+            return raw
+    try:
+        settings = load_config_with_main("main.yaml")
+    except Exception:
+        return None
+    tools = settings.get("tools", {}) if isinstance(settings, dict) else {}
+    web_search = tools.get("web_search", {}) if isinstance(tools, dict) else {}
+    if isinstance(web_search, dict):
+        for key in ("search_engine", "engine"):
+            raw = _as_str(web_search.get(key))
+            if raw:
+                return raw
+    return None
+
+
 def _search_profiles(catalog: dict[str, Any]) -> list[dict[str, Any]]:
     profiles = catalog.get("services", {}).get("search", {}).get("profiles", [])
     return [
@@ -1572,6 +1727,7 @@ def resolve_search_runtime_config(
         base_url=base_url,
         max_results=max_results,
         proxy=proxy,
+        search_engine=_resolve_search_engine(loaded),
         unsupported_provider=False,
         deprecated_provider=False,
         missing_credentials=bool(missing) and not spec.soft_fallback,
@@ -1602,6 +1758,12 @@ __all__ = [
     "search_missing_credential",
     "search_fallback_candidates",
     "supported_search_providers_hint",
+    "FETCH_PROVIDERS",
+    "SUPPORTED_FETCH_PROVIDERS",
+    "DEFAULT_FETCH_PROVIDER",
+    "FetchProviderSpec",
+    "fetch_provider_spec",
+    "supported_fetch_providers_hint",
     "NANOBOT_LLM_PROVIDERS",
     "EmbeddingProviderSpec",
     "EMBEDDING_PROVIDERS",

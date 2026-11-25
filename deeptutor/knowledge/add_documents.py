@@ -7,13 +7,12 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-import itertools
 import json
 import logging
 from pathlib import Path
-import shutil
 from typing import TYPE_CHECKING, List, Optional
 
+from deeptutor.knowledge.staging import content_hash, stage_source
 from deeptutor.services.config import resolve_llm_runtime_config
 from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
@@ -24,7 +23,6 @@ from deeptutor.services.rag.factory import (
     has_ready_provider_index,
     normalize_provider_name,
 )
-from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.services.rag.index_probe import provider_failure_summary
 from deeptutor.services.rag.index_versioning import list_kb_versions
 from deeptutor.services.rag.provider_binding import resolve_bound_provider
@@ -34,6 +32,7 @@ from deeptutor.services.setup.data_volume import (
     ensure_data_volume_writable,
     format_data_volume_permission_error,
 )
+from deeptutor.utils.file_types import FileTypeRouter
 
 logger = logging.getLogger(__name__)
 
@@ -123,16 +122,10 @@ def _raw_hash_key(file_path: Path, raw_dir: Path) -> str:
         return file_path.name
 
 
-def _file_hash(file_path: Path) -> str:
-    from deeptutor.services.file_digest import file_sha256
-
-    return file_sha256(file_path)
-
-
 def hashes_for_indexed_files(file_paths: list[str], raw_dir: Path) -> dict[str, str]:
     """Hash source files already confirmed in an index, keyed by their raw path."""
     return {
-        _raw_hash_key(Path(file_path), raw_dir): _file_hash(Path(file_path))
+        _raw_hash_key(Path(file_path), raw_dir): content_hash(Path(file_path))
         for file_path in file_paths
     }
 
@@ -265,7 +258,7 @@ class DocumentAdder:
         return resolve_bound_provider(self.base_dir, self.kb_name)
 
     def _get_file_hash(self, file_path: Path) -> str:
-        return _file_hash(file_path)
+        return content_hash(file_path)
 
     def get_ingested_hashes(self) -> dict[str, str]:
         if self.metadata_file.exists():
@@ -276,24 +269,6 @@ class DocumentAdder:
             except Exception:
                 return {}
         return {}
-
-    @staticmethod
-    def _non_colliding(dest_path: Path) -> Path:
-        """A free sibling name for a *different* document that wants a taken one.
-
-        Two files can legitimately share a name and hold different content — a
-        docs tree with a README.md per folder is the ordinary case, and batched
-        syncs of sibling folders stage them against different roots, so they
-        land on the same name even with structure preserved. Dropping the later
-        one loses a document the user asked to index, silently.
-        """
-        if not dest_path.exists():
-            return dest_path
-        for index in itertools.count(2):
-            candidate = dest_path.with_name(f"{dest_path.stem} ({index}){dest_path.suffix}")
-            if not candidate.exists():
-                return candidate
-        raise AssertionError("unreachable")  # pragma: no cover
 
     def add_documents(
         self,
@@ -341,20 +316,12 @@ class DocumentAdder:
             else:
                 dest_path = self.raw_dir / source_path.name
 
-            if dest_path.exists():
-                dest_hash = self._get_file_hash(dest_path)
-                if dest_hash == current_hash:
-                    logger.info(f"Recovering staged file: {source_path.name}")
-                    files_to_process.append(dest_path)
-                    continue
-                # Same name, different document: keep both rather than
-                # silently dropping this one.
-                dest_path = self._non_colliding(dest_path)
-
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, dest_path)
-            logger.info(f"Staged to raw: {dest_path.relative_to(self.raw_dir).as_posix()}")
-            files_to_process.append(dest_path)
+            staged_path, copied = stage_source(source_path, dest_path, source_hash=current_hash)
+            if copied:
+                logger.info(f"Staged to raw: {staged_path.relative_to(self.raw_dir).as_posix()}")
+            else:
+                logger.info(f"Recovering staged file: {source_path.name}")
+            files_to_process.append(staged_path)
 
         return files_to_process
 
@@ -365,105 +332,119 @@ class DocumentAdder:
 
         if self.rag_provider == LIGHTRAG_PROVIDER:
             return await self._process_lightrag_batch(new_files)
+        # LlamaIndex publishes a full snapshot on every add_documents call.
+        # One call for the whole staged list keeps folder sync at one version
+        # instead of one version per file (#2173). A single file stays on the
+        # per-file path, and a batch that throws falls back there so one bad
+        # file does not discard the others.
+        if self.rag_provider == DEFAULT_PROVIDER and len(new_files) > 1:
+            return await self._process_llamaindex_batch(new_files)
+        return await self._process_provider_files_one_by_one(new_files)
+
+    async def _process_llamaindex_batch(self, new_files: List[Path]) -> DocumentIndexResult:
+        """Index every staged file in one LlamaIndex publish."""
+        requested = {str(path.resolve()): path for path in new_files}
+        confirmed: list[Path] = []
+        seen: set[str] = set()
+        callback_fired = False
+
+        def on_indexed(paths: list[str]) -> None:
+            nonlocal callback_fired
+            callback_fired = True
+            for raw in paths:
+                try:
+                    key = str(Path(raw).resolve())
+                except OSError:
+                    continue
+                path = requested.get(key)
+                if path is None or key in seen:
+                    continue
+                seen.add(key)
+                confirmed.append(path)
 
         rag_service = RAGService(kb_base_dir=str(self.base_dir), provider=self.rag_provider)
-
-        # The default engine accepts a file list and rewrites the index once;
-        # indexing the files one by one reloaded, re-validated, re-persisted
-        # and re-verified the whole index (and rebuilt BM25) per file. Batch
-        # first, and fall back to per-file isolation only if the batch fails,
-        # so one bad file still cannot take the others down.
-        if self.rag_provider == DEFAULT_PROVIDER and len(new_files) > 1:
-            batched = await self._process_batched(new_files, rag_service)
-            if batched is not None:
-                return batched
-
-        return await self._process_files_individually(new_files, rag_service)
-
-    async def _process_batched(
-        self,
-        files: List[Path],
-        rag_service: RAGService,
-    ) -> DocumentIndexResult | None:
-        """Index every file in one provider call; ``None`` means fall back."""
-        from deeptutor.knowledge.progress_tracker import ProgressStage
-
-        total_files = len(files)
+        total_files = len(new_files)
         if self.progress_tracker is not None:
+            from deeptutor.knowledge.progress_tracker import ProgressStage
+
             self.progress_tracker.update(
                 ProgressStage.PROCESSING_FILE,
-                message=f"Indexing {total_files} files",
+                message_key="Queued {{count}} files for indexing.",
+                message_params={"count": total_files},
                 current=0,
                 total=total_files,
             )
         try:
             success = await rag_service.add_documents(
-                self.kb_name, [str(doc_file) for doc_file in files]
+                self.kb_name,
+                [str(path) for path in new_files],
+                indexed_file_callback=on_indexed,
             )
-        except PermissionError as e:
-            logger.exception("Permission denied while indexing a batch: %s", e)
+        except PermissionError as exc:
+            logger.exception("Permission denied while indexing a LlamaIndex batch: %s", exc)
             raise DataVolumePermissionError(
-                format_data_volume_permission_error(self.kb_dir, cause=e)
-            ) from e
+                format_data_volume_permission_error(self.kb_dir, cause=exc)
+            ) from exc
         except Exception as exc:
             logger.warning(
-                "Batched indexing of %d files failed; retrying one file at a time: %s",
+                "LlamaIndex batch of %d file(s) failed (%s); retrying one file at a time",
                 total_files,
                 exc,
-                exc_info=True,
             )
-            return None
+            return await self._process_provider_files_one_by_one(new_files)
+
         if not success:
-            logger.warning(
-                "Batched indexing of %d files was rejected; retrying one file at a time",
-                total_files,
+            return DocumentIndexResult(
+                processed_files=[],
+                failures=[
+                    DocumentIndexFailure(path, "Provider returned failure without details.")
+                    for path in new_files
+                ],
             )
-            return None
+        # Pipelines that do not report per-file receipts still indexed the
+        # batch. A receipt that omits a file means that file was skipped.
+        processed = list(new_files) if not callback_fired else confirmed
+        failures = [
+            DocumentIndexFailure(path, "Provider skipped this file.")
+            for path in new_files
+            if path not in processed
+        ]
+        recorded: list[Path] = []
+        for path in processed:
+            try:
+                await self._record_hash_after_index(path)
+            except Exception as exc:
+                logger.exception("Failed %s: %s", path.name, exc)
+                failures.append(DocumentIndexFailure(path, str(exc)))
+                continue
+            recorded.append(path)
+            logger.info("Processed: %s", path.name)
+        if self.progress_tracker is not None:
+            from deeptutor.knowledge.progress_tracker import ProgressStage
 
-        processed_files: list[Path] = []
-        for doc_file in files:
-            await self._record_hash_after_index(doc_file)
-            logger.info(f"Processed: {doc_file.name}")
-            processed_files.append(doc_file)
-            if self.progress_tracker is not None:
-                self.progress_tracker.update(
-                    ProgressStage.PROCESSING_FILE,
-                    message_key="Indexed {{name}}",
-                    message_params={"name": doc_file.name},
-                    current=len(processed_files),
-                    total=total_files,
-                )
-        return DocumentIndexResult(processed_files=processed_files, failures=[])
-
-    async def _record_hash_after_index(self, doc_file: Path) -> None:
-        """Record the duplicate-detection hash after a successful index.
-
-        Re-hashing reads the whole file, so it stays off the event loop: this
-        runs inside a FastAPI BackgroundTasks entry, which is awaited on the
-        loop and would otherwise stall unrelated requests once per file (#777).
-        """
-        try:
-            await asyncio.to_thread(self._record_successful_hash, doc_file)
-        except Exception:
-            if self.rag_provider != LIGHTRAG_PROVIDER:
-                raise
-            logger.warning(
-                "LightRAG published '%s' before its duplicate-detection hash was recorded",
-                doc_file.name,
-                exc_info=True,
+            self.progress_tracker.update(
+                ProgressStage.PROCESSING_FILE,
+                message_key="Successfully processed {{count}} files!",
+                message_params={"count": len(recorded)},
+                current=len(recorded),
+                total=total_files,
             )
+        return DocumentIndexResult(processed_files=recorded, failures=failures)
 
-    async def _process_files_individually(
-        self,
-        new_files: List[Path],
-        rag_service: RAGService,
+    async def _process_provider_files_one_by_one(
+        self, new_files: List[Path]
     ) -> DocumentIndexResult:
-        """Per-file isolation: one failure never blocks the rest of the batch."""
+        """Index each staged file with its own provider call.
+
+        PageIndex and GraphRAG stay on this path. LlamaIndex uses it for a
+        single file, and as the fallback when a multi-file publish throws.
+        """
+        rag_service = RAGService(kb_base_dir=str(self.base_dir), provider=self.rag_provider)
         processed_files: list[Path] = []
         failures: list[DocumentIndexFailure] = []
         total_files = len(new_files)
 
-        for idx, doc_file in enumerate(new_files, 1):
+        for doc_file in new_files:
             try:
                 if self.progress_tracker is not None:
                     from deeptutor.knowledge.progress_tracker import ProgressStage
@@ -503,6 +484,24 @@ class DocumentAdder:
                 failures.append(DocumentIndexFailure(doc_file, str(e)))
 
         return DocumentIndexResult(processed_files=processed_files, failures=failures)
+
+    async def _record_hash_after_index(self, doc_file: Path) -> None:
+        """Record the duplicate-detection hash after a successful index.
+
+        Re-hashing reads the whole file, so it stays off the event loop: this
+        runs inside a FastAPI BackgroundTasks entry, which is awaited on the
+        loop and would otherwise stall unrelated requests once per file (#777).
+        """
+        try:
+            await asyncio.to_thread(self._record_successful_hash, doc_file)
+        except Exception:
+            if self.rag_provider != LIGHTRAG_PROVIDER:
+                raise
+            logger.warning(
+                "LightRAG published '%s' before its duplicate-detection hash was recorded",
+                doc_file.name,
+                exc_info=True,
+            )
 
     async def _process_lightrag_batch(self, files: List[Path]) -> DocumentIndexResult:
         """Hold native write ownership across the entire accepted batch."""

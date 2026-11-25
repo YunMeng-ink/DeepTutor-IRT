@@ -551,6 +551,121 @@ def test_llm_onomeo_base_url_detection_preserves_openai_binding_compatibility() 
     assert resolved.effective_url == "https://onomeo.com/v1"
 
 
+def test_llm_runcrate_binding_uses_default_openai_compatible_endpoint() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "Runcrate",
+            "binding": "runcrate",
+            "base_url": "",
+            "api_key": "runcrate-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "DeepSeek V4.1 Flash",
+                    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "runcrate"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.binding == "runcrate"
+    assert resolved.model == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert resolved.api_key == "runcrate-key"
+    assert resolved.effective_url == "https://api.runcrate.ai/v1"
+
+
+def test_llm_runcrate_base_url_detection_preserves_openai_binding_compatibility() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "OpenAI Compatible",
+            "binding": "openai",
+            "base_url": "https://api.runcrate.ai/v1",
+            "api_key": "runcrate-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "DeepSeek V4.1 Flash",
+                    "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "runcrate"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.effective_url == "https://api.runcrate.ai/v1"
+
+
+def test_llm_llmtr_binding_uses_default_openai_compatible_endpoint() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "LLMTR",
+            "binding": "llmtr",
+            "base_url": "",
+            "api_key": "llmtr-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "Qwen 3.8 27B",
+                    "model": "llmtr/qwen3-8-27b",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "llmtr"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.binding == "llmtr"
+    assert resolved.model == "llmtr/qwen3-8-27b"
+    assert resolved.api_key == "llmtr-key"
+    assert resolved.effective_url == "https://llmtr.com/v1"
+
+
+def test_llm_llmtr_base_url_detection_preserves_openai_binding_compatibility() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "OpenAI Compatible",
+            "binding": "openai",
+            "base_url": "https://llmtr.com/v1",
+            "api_key": "llmtr-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "Qwen 3.8 27B",
+                    "model": "llmtr/qwen3-8-27b",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "llmtr"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.model == "llmtr/qwen3-8-27b"
+    assert resolved.effective_url == "https://llmtr.com/v1"
+
+
 def test_llm_novita_binding_uses_default_openai_compatible_endpoint() -> None:
     catalog = _build_catalog(
         llm_profile={
@@ -1048,6 +1163,63 @@ def test_search_searxng_without_url_fallback() -> None:
     assert resolved.fallback_reason is not None
 
 
+def _zhipu_search_profile(**overrides) -> dict:
+    profile = {
+        "id": "search-p",
+        "name": "Search",
+        "provider": "zhipu",
+        "base_url": "",
+        "api_key": "zhipu-key",
+        "proxy": "",
+        "models": [],
+    }
+    profile.update(overrides)
+    return profile
+
+
+def test_search_engine_resolves_from_active_profile(monkeypatch) -> None:
+    """The profile's engine field rides the resolved config into web_search."""
+    monkeypatch.setattr(
+        "deeptutor.services.config.provider_runtime.load_config_with_main",
+        lambda *_args, **_kwargs: {},
+    )
+    catalog = _build_catalog(search_profile=_zhipu_search_profile(search_engine="search_pro"))
+    resolved = resolve_search_runtime_config(catalog=catalog)
+    assert resolved.provider == "zhipu"
+    assert resolved.search_engine == "search_pro"
+
+
+def test_search_engine_accepts_the_engine_alias(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "deeptutor.services.config.provider_runtime.load_config_with_main",
+        lambda *_args, **_kwargs: {},
+    )
+    catalog = _build_catalog(search_profile=_zhipu_search_profile(engine="search_pro"))
+    assert resolve_search_runtime_config(catalog=catalog).search_engine == "search_pro"
+
+
+def test_search_engine_falls_back_to_web_search_config(monkeypatch) -> None:
+    """No profile field: the main.yaml `tools.web_search` default applies."""
+    monkeypatch.setattr(
+        "deeptutor.services.config.provider_runtime.load_config_with_main",
+        lambda *_args, **_kwargs: {"tools": {"web_search": {"search_engine": "search_pro"}}},
+    )
+    catalog = _build_catalog(search_profile=_zhipu_search_profile())
+    resolved = resolve_search_runtime_config(catalog=catalog)
+    assert resolved.search_engine == "search_pro"
+
+
+def test_search_engine_is_none_when_unconfigured(monkeypatch) -> None:
+    """Nothing set anywhere: providers keep their own default engine."""
+    monkeypatch.setattr(
+        "deeptutor.services.config.provider_runtime.load_config_with_main",
+        lambda *_args, **_kwargs: {},
+    )
+    catalog = _build_catalog(search_profile=_zhipu_search_profile(search_engine="  "))
+    resolved = resolve_search_runtime_config(catalog=catalog)
+    assert resolved.search_engine is None
+
+
 def _search_profile(pid: str, provider: str, **overrides) -> dict:
     profile = {
         "id": pid,
@@ -1172,3 +1344,117 @@ def test_llm_opper_base_url_detection_preserves_openai_binding_compatibility() -
     assert resolved.provider_name == "opper"
     assert resolved.provider_mode == "gateway"
     assert resolved.effective_url == "https://api.opper.ai/v3/compat"
+
+
+def test_llm_cloudgpu_binding_uses_default_openai_compatible_endpoint() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "CloudGPU",
+            "binding": "cloudgpu",
+            "base_url": "",
+            "api_key": "cloudgpu-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "DeepSeek V4.1 Flash",
+                    "model": "deepseek-v4.1-flash",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "cloudgpu"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.binding == "cloudgpu"
+    assert resolved.model == "deepseek-v4.1-flash"
+    assert resolved.api_key == "cloudgpu-key"
+    assert resolved.effective_url == "https://cloudgpu.app/v1"
+
+
+def test_llm_cloudgpu_base_url_detection_preserves_openai_binding_compatibility() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "OpenAI Compatible",
+            "binding": "openai",
+            "base_url": "https://cloudgpu.app/v1",
+            "api_key": "cloudgpu-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "DeepSeek V4.1 Flash",
+                    "model": "deepseek-v4.1-flash",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "cloudgpu"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.effective_url == "https://cloudgpu.app/v1"
+
+
+def test_llm_standardcompute_binding_uses_default_openai_compatible_endpoint() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "Standard Compute",
+            "binding": "standardcompute",
+            "base_url": "",
+            "api_key": "standardcompute-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "Standard Compute router",
+                    "model": "StandardCompute",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "standardcompute"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.binding == "standardcompute"
+    assert resolved.model == "StandardCompute"
+    assert resolved.api_key == "standardcompute-key"
+    assert resolved.effective_url == "https://api.stdcmpt.com/v1"
+
+
+def test_llm_standardcompute_base_url_detection_preserves_openai_binding_compatibility() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "OpenAI Compatible",
+            "binding": "openai",
+            "base_url": "https://api.stdcmpt.com/v1",
+            "api_key": "standardcompute-key",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [
+                {
+                    "id": "llm-m",
+                    "name": "Standard Compute router",
+                    "model": "StandardCompute",
+                }
+            ],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "standardcompute"
+    assert resolved.provider_mode == "gateway"
+    assert resolved.effective_url == "https://api.stdcmpt.com/v1"

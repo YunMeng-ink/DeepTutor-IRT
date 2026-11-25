@@ -21,7 +21,7 @@ import uuid
 import zipfile
 
 from deeptutor.multi_user.paths import get_account_path_service
-from deeptutor.services.file_io import atomic_write_json
+from deeptutor.services.file_io import atomic_write_json, read_text
 from deeptutor.services.path_service import get_path_service
 from deeptutor.services.workspace.activity import data_activity
 from deeptutor.services.workspace.context import workspace_context
@@ -38,6 +38,7 @@ FEATURES = {
     "notebook": "Notebooks",
     "co-writer": "Writing",
     "courses": "Courses",
+    "learning_journal": "Learning journal",
     "files": "File library",
     "knowledge_bases": "Knowledge bases",
     "parse_cache": "Document cache",
@@ -77,6 +78,8 @@ def _feature_path(paths, feature: str) -> Path:
         return paths.get_knowledge_bases_root()
     if feature == "parse_cache":
         return paths.get_parse_cache_root()
+    if feature == "learning_journal":
+        return paths.get_learning_journal_dir()
     if feature == "files":
         return paths.get_workspace_dir() / "library"
     if feature == "outputs":
@@ -317,11 +320,20 @@ def preview(
     with workspace_context(source_id):
         source = get_path_service()
         sessions = _sessions(source)
+        if session_ids is not None and (
+            not session_ids or session_ids - {row["id"] for row in sessions}
+        ):
+            raise WorkspaceError("Select existing conversations from the source workspace.")
         from deeptutor.services.workspace.dependencies import dependency_closure
 
         closure_warnings: list[str] = []
         selected, session_ids = dependency_closure(
-            source, sessions, features, session_ids=session_ids, warnings=closure_warnings
+            source,
+            sessions,
+            features,
+            session_ids=session_ids,
+            warnings=closure_warnings,
+            target_workspace_id=target_id,
         )
         # Legacy capability artifacts may be keyed by turn IDs. Preserve a
         # copy of the chat/output trees while transferring only selected rows.
@@ -375,22 +387,13 @@ def preview(
             root = _feature_path(source, feature)
             artifacts[feature] = [path.relative_to(root).as_posix() for path in _files(root)]
         if _backend() == "sqlite" and session_ids and target.get_chat_history_db().exists():
-            with closing(sqlite3.connect(source.get_chat_history_db())) as conn, conn:
-                conn.execute("ATTACH DATABASE ? AS target", (str(target.get_chat_history_db()),))
-                placeholders = ",".join("?" for _ in session_ids)
-                for table, owner in (
-                    ("sessions", "id"),
-                    ("messages", "session_id"),
-                    ("notebook_entries", "session_id"),
-                ):
-                    if conn.execute(
-                        f"SELECT 1 FROM main.{table} a JOIN target.{table} b ON a.id=b.id WHERE a.{owner} IN ({placeholders}) LIMIT 1",  # nosec B608 - fixed tables and placeholders
-                        list(session_ids),
-                    ).fetchone():
-                        blockers.append(
-                            "The destination contains conflicting conversation or question IDs. Choose an empty workspace."
-                        )
-                        break
+            from deeptutor.services.workspace.session_transfer import session_conflicts
+
+            blockers.extend(
+                session_conflicts(
+                    source.get_chat_history_db(), target.get_chat_history_db(), session_ids
+                )
+            )
         for row in rows:
             destination = _feature_path(target, row["feature"])
             if row["feature"] in artifacts:
@@ -492,7 +495,7 @@ def _selected_artifact_files(paths, session_ids: set[str]) -> dict[str, list[str
     root = _feature_path(paths, "presentations")
     presented = set()
     for path in root.glob("*/items/*.json"):
-        item = json.loads(path.read_text())
+        item = json.loads(read_text(path))
         if identifiers.intersection(Path(item.get("relative_path", "")).parts) or any(
             path.stem in url for url in referenced_urls
         ):
@@ -763,7 +766,7 @@ def _pocketbase_rebind(snapshot: Path, target_id: str | None) -> None:
     from deeptutor.services.session.pocketbase_store import _json_loads, _pb
     from deeptutor.services.workspace.references import rebind_local_urls
 
-    saved = json.loads(snapshot.read_text())
+    saved = json.loads(read_text(snapshot))
     collection = _pb().collection("sessions")
     for row in saved["sessions"]:
         prefs = _json_loads(row.get("preferences_json"), {})
@@ -910,7 +913,7 @@ def _restore_sessions(root: Path, source, target) -> None:
 
 def _read_journal(path: Path) -> dict:
     """Validate recovery control data before it can authorize filesystem changes."""
-    row = json.loads(path.read_text())
+    row = json.loads(read_text(path))
     terminal = {"completed", "exported", "recovered"}
     pending = {
         "preparing",
@@ -1048,7 +1051,7 @@ def recover_operation(operation_id: str) -> dict:
                 original = _feature_path(source, feature)
                 snapshot = root / "snapshot" / feature
                 if original.exists() and snapshot.exists():
-                    manifest = json.loads((root / "manifest.json").read_text())[feature]
+                    manifest = json.loads(read_text(root / "manifest.json"))[feature]
                     # Back up databases through SQLite again: byte hashes of
                     # a source with WAL pages cannot match the backup file.
                     check = root / "cleanup-check" / feature

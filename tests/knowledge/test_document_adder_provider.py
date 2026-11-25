@@ -475,114 +475,133 @@ def test_empty_bootstrap_does_not_replace_broken_existing_index(tmp_path, storag
         DocumentAdder(kb_name="kb", base_dir=str(tmp_path), rag_provider="llamaindex")
 
 
-def _write_llamaindex_docs(tmp_path: Path, count: int) -> list[Path]:
+def _llamaindex_adder(tmp_path: Path, names: list[str]) -> tuple[DocumentAdder, list[Path]]:
     kb_dir = tmp_path / "kb"
     raw_dir = kb_dir / "raw"
     raw_dir.mkdir(parents=True)
     _write_provider_version(kb_dir, "llamaindex")
-    docs = []
-    for index in range(count):
-        doc = raw_dir / f"doc-{index}.txt"
-        doc.write_text(f"content {index}", encoding="utf-8")
-        docs.append(doc)
-    return docs
+    files = []
+    for name in names:
+        path = raw_dir / name
+        path.write_text(name, encoding="utf-8")
+        files.append(path)
+    return DocumentAdder(kb_name="kb", base_dir=str(tmp_path), rag_provider="llamaindex"), files
 
 
-def test_process_new_documents_indexes_a_batch_in_one_provider_call(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """One call per batch: each per-file call reloaded, re-persisted and
-    re-verified the whole index, so N files meant N full index rewrites."""
-    docs = _write_llamaindex_docs(tmp_path, 3)
+def test_llamaindex_indexes_a_folder_batch_in_one_publish(monkeypatch, tmp_path: Path) -> None:
+    adder, files = _llamaindex_adder(tmp_path, ["a.txt", "b.txt"])
     calls: list[list[str]] = []
 
-    class _BatchingRagService:
+    class _BatchService:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        async def add_documents(self, _kb_name, file_paths, **_kwargs) -> bool:
+        async def add_documents(self, _kb_name, file_paths, **kwargs):
             calls.append(list(file_paths))
+            kwargs["indexed_file_callback"](file_paths)
             return True
 
-    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _BatchingRagService)
-    adder = DocumentAdder(kb_name="kb", base_dir=str(tmp_path))
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _BatchService)
 
-    result = asyncio.run(adder.process_new_documents(docs))
+    result = asyncio.run(adder.process_new_documents(files))
 
-    assert calls == [[str(doc) for doc in docs]]
-    assert result.processed_files == docs
-    assert result.failed_count == 0
-    assert len(adder.get_ingested_hashes()) == 3
+    assert calls == [[str(path) for path in files]]
+    assert result.processed_files == files
+    assert result.failures == []
+    assert set(adder.get_ingested_hashes()) == {"a.txt", "b.txt"}
 
 
-def test_process_new_documents_falls_back_to_per_file_on_batch_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """A failed batch must not lose the files that would index on their own."""
-    docs = _write_llamaindex_docs(tmp_path, 3)
-    calls: list[list[str]] = []
+def test_llamaindex_batch_reports_files_the_provider_skipped(monkeypatch, tmp_path: Path) -> None:
+    adder, files = _llamaindex_adder(tmp_path, ["kept.txt", "skipped.txt"])
 
-    class _FlakyRagService:
+    class _PartialService:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        async def add_documents(self, _kb_name, file_paths, **_kwargs) -> bool:
+        async def add_documents(self, _kb_name, file_paths, **kwargs):
+            kwargs["indexed_file_callback"](file_paths[:1])
+            return True
+
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _PartialService)
+
+    result = asyncio.run(adder.process_new_documents(files))
+
+    assert result.processed_files == [files[0]]
+    assert result.failed_count == 1
+    assert "skipped" in result.failure_summary()
+    assert set(adder.get_ingested_hashes()) == {"kept.txt"}
+
+
+def test_llamaindex_batch_failure_retries_one_file_at_a_time(monkeypatch, tmp_path: Path) -> None:
+    adder, files = _llamaindex_adder(tmp_path, ["a.txt", "b.txt"])
+    calls: list[list[str]] = []
+
+    class _FallbackService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def add_documents(self, _kb_name, file_paths, **_kwargs):
             calls.append(list(file_paths))
             if len(file_paths) > 1:
                 raise RuntimeError("batch exploded")
-            return "bad" not in file_paths[0]
+            return True
 
-    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _FlakyRagService)
-    adder = DocumentAdder(kb_name="kb", base_dir=str(tmp_path))
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _FallbackService)
 
-    result = asyncio.run(adder.process_new_documents(docs))
+    result = asyncio.run(adder.process_new_documents(files))
 
-    assert calls[0] == [str(doc) for doc in docs]
-    assert calls[1:] == [[str(doc)] for doc in docs]
-    assert result.processed_files == docs
-    assert result.failed_count == 0
+    assert calls == [[str(path) for path in files], [str(files[0])], [str(files[1])]]
+    assert result.processed_files == files
+    assert result.failures == []
 
 
-def test_process_new_documents_keeps_per_file_failure_isolation(
+def test_llamaindex_batch_permission_error_is_not_retried(monkeypatch, tmp_path: Path) -> None:
+    from deeptutor.services.setup.data_volume import DataVolumePermissionError
+
+    adder, files = _llamaindex_adder(tmp_path, ["a.txt", "b.txt"])
+    calls: list[int] = []
+
+    class _DeniedService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def add_documents(self, *_args, **_kwargs):
+            calls.append(1)
+            raise PermissionError("denied")
+
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _DeniedService)
+
+    with pytest.raises(DataVolumePermissionError):
+        asyncio.run(adder.process_new_documents(files))
+    assert calls == [1]
+
+
+def test_non_llamaindex_provider_still_indexes_one_file_per_call(
     monkeypatch, tmp_path: Path
 ) -> None:
-    docs = _write_llamaindex_docs(tmp_path, 2)
-
-    class _RejectingBatchRagService:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        async def add_documents(self, _kb_name, file_paths, **_kwargs) -> bool:
-            if len(file_paths) > 1:
-                return False
-            return not file_paths[0].endswith("doc-0.txt")
-
-    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _RejectingBatchRagService)
-    adder = DocumentAdder(kb_name="kb", base_dir=str(tmp_path))
-
-    result = asyncio.run(adder.process_new_documents(docs))
-
-    assert result.processed_files == [docs[1]]
-    assert result.failed_count == 1
-    assert result.failures[0].file_path == docs[0]
-
-
-def test_single_file_add_skips_the_batch_layer(monkeypatch, tmp_path: Path) -> None:
-    docs = _write_llamaindex_docs(tmp_path, 1)
+    kb_dir = tmp_path / "kb"
+    raw_dir = kb_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    _write_provider_version(kb_dir, "pageindex")
+    files = []
+    for name in ("a.txt", "b.txt"):
+        path = raw_dir / name
+        path.write_text(name, encoding="utf-8")
+        files.append(path)
     calls: list[list[str]] = []
 
-    class _RagService:
+    class _PerFileService:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        async def add_documents(self, _kb_name, file_paths, **_kwargs) -> bool:
+        async def add_documents(self, _kb_name, file_paths, **_kwargs):
             calls.append(list(file_paths))
             return True
 
-    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _RagService)
-    adder = DocumentAdder(kb_name="kb", base_dir=str(tmp_path))
+    monkeypatch.setattr("deeptutor.knowledge.add_documents.RAGService", _PerFileService)
+    adder = DocumentAdder(kb_name="kb", base_dir=str(tmp_path), rag_provider="pageindex")
 
-    result = asyncio.run(adder.process_new_documents(docs))
+    result = asyncio.run(adder.process_new_documents(files))
 
-    assert calls == [[str(docs[0])]]
-    assert result.processed_files == docs
+    assert calls == [[str(files[0])], [str(files[1])]]
+    assert result.processed_files == files

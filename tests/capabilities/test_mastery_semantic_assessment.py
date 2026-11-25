@@ -416,6 +416,187 @@ async def test_question_support_must_quote_real_evidence(service, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_question_support_retries_a_mismatched_quote(service, monkeypatch):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    source = "alpha is the first letter"
+    progress.lesson_evidence["kp1"] = {"sources": [{"ref": {}, "text": source}]}
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+    instructions = []
+
+    async def request(config, instruction, *args, **kwargs):
+        instructions.append(instruction)
+        quote = "alpha comes first" if len(instructions) == 1 else source
+        return {"supported": True, "citations": [{"index": 0, "quote": quote}]}
+
+    monkeypatch.setattr(semantic, "_request", request)
+    question = leaf()
+    await semantic.bind_question(service.store, progress, question)
+    assert len(instructions) == 2
+    assert "prior citation did not match" in instructions[1]
+    assert question.source_evidence["assessment_contract"]["citations"] == [
+        {"index": 0, "quote": source}
+    ]
+
+
+def _source_packet(*texts):
+    return {"sources": [{"ref": {}, "text": text} for text in texts]}
+
+
+@pytest.mark.asyncio
+async def test_restated_correct_question_is_refused_without_spending_a_request(
+    service, monkeypatch
+):
+    """A question already answered correctly must not be re-registered.
+
+    When novel questions fail source verification the tutor falls back on the
+    one item that always binds and re-poses what the learner already got right.
+    That is not fresh evidence, so ``bind_questions`` refuses the restatement
+    before the bounded source request is even attempted.
+    """
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = _source_packet("alpha is the first letter")
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+    prior = leaf(expected="alpha")
+    prior.source_evidence = _source_packet("alpha is the first letter")
+    service.store.save(progress)
+    service.register_question("p", prior)
+    service.grade_interaction("p", answer="alpha", question_id="q1")
+    assert service.store.load("p").quiz_attempts[0].is_correct
+
+    calls = []
+
+    async def request(*args, **kwargs):
+        calls.append(args)
+        return {
+            "supported": True,
+            "citations": [{"index": 0, "quote": "alpha is the first letter"}],
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    restated = leaf("q2")
+    restated.prompt = prior.prompt  # Exact source-backed exercise, not a fuzzy match.
+    with pytest.raises(semantic.AssessmentUnavailable, match="already answered correctly"):
+        await semantic.bind_question(service.store, progress, restated)
+    assert not calls
+
+
+@pytest.mark.asyncio
+async def test_distinct_question_on_the_same_objective_is_not_refused(service, monkeypatch):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = _source_packet("alpha and beta are letters")
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+    service.register_question("p", leaf(expected="alpha"))
+    service.grade_interaction("p", answer="alpha", question_id="q1")
+
+    async def request(*args, **kwargs):
+        return {
+            "supported": True,
+            "citations": [{"index": 0, "quote": "alpha and beta are letters"}],
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    distinct = leaf("q2", expected="beta")
+    distinct.prompt = "How many distinct letters follow the open relationship?"
+    await semantic.bind_question(service.store, progress, distinct)
+    assert distinct.source_evidence["assessment_contract"]["provenance"] == "adapted"
+
+
+@pytest.mark.asyncio
+async def test_same_answer_key_with_a_different_stem_is_not_refused(service, monkeypatch):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = _source_packet("alpha is the first letter")
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+    service.register_question("p", leaf(expected="alpha"))
+    service.grade_interaction("p", answer="alpha", question_id="q1")
+
+    async def request(*args, **kwargs):
+        return {
+            "supported": True,
+            "citations": [{"index": 0, "quote": "alpha is the first letter"}],
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    same_key = leaf("q2", expected="alpha")
+    same_key.prompt = "How many moons does Jupiter have?"
+    await semantic.bind_question(service.store, progress, same_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_text, quote",
+    [
+        # A PDF line wrap and indentation split the parsed words.
+        (
+            "…看出如何組織、表達與連結數學想\n   法；…",
+            "…看出如何組織、表達與連結數學想法；…",
+        ),
+        # HTML table markup is present only in the parsed text.
+        (
+            "<tr><td>alpha</td><td>is</td></tr> the first letter",
+            "alpha is the first letter",
+        ),
+        # Full-width parentheses in the parsed text vs. half-width in the quote.
+        (
+            "The set （alpha, beta） is ordered",
+            "The set (alpha, beta) is ordered",
+        ),
+    ],
+)
+async def test_faithful_citation_tolerates_formatting_only_differences(
+    service, monkeypatch, source_text, quote
+):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = {"sources": [{"ref": {}, "text": source_text}]}
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+
+    async def request(*args, **kwargs):
+        return {
+            "supported": True,
+            "citations": [{"index": 0, "quote": quote}],
+            "provenance": "adapted",
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    question = leaf()
+    await semantic.bind_question(service.store, progress, question)
+    assert question.source_evidence["assessment_contract"]["citations"] == [
+        {"index": 0, "quote": quote}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_quote_still_rejected_after_normalization(service, monkeypatch):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = {"sources": [{"ref": {}, "text": "alpha and beta"}]}
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+
+    async def request(*args, **kwargs):
+        return {"supported": True, "citations": [{"index": 0, "quote": " \n\t*_`| "}]}
+
+    monkeypatch.setattr(semantic, "_request", request)
+    with pytest.raises(semantic.AssessmentUnavailable, match="absent"):
+        await semantic.bind_question(service.store, progress, leaf())
+
+
+@pytest.mark.asyncio
 async def test_group_source_binding_is_one_call_with_individual_contracts(service, monkeypatch):
     from deeptutor.learning import lesson_evidence
     from deeptutor.learning import semantic_assessment as semantic
@@ -572,7 +753,7 @@ async def test_scoped_group_clarification_resume_and_exactly_once_credit(service
         ],
     }
 
-    def source_check(store, progress, kp_id, evidence, *, allow_partial=False):
+    def source_check(store, progress, kp_id, evidence, *, allow_partial=False, **_flags):
         assert evidence["id"] == "scoped-source"
         if not allow_partial:
             raise lesson_evidence.LessonUnavailable("Only this focused teaching slice is covered")
@@ -623,3 +804,159 @@ async def test_scoped_group_clarification_resume_and_exactly_once_credit(service
     assert [attempt.question_id for attempt in progress.quiz_attempts] == ["q1", "q2"]
     replay, _, replayed = await service.grade_interaction_semantic("p", answer="", question_id="g")
     assert replayed and len(replay.learning_evidence) == 2 and len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_text, quote",
+    [
+        ("x_1", "x1"),
+        ("a*b", "ab"),
+        ("x < 0 and y > 1", "x1"),
+        ("x₂", "x2"),
+        ("x²", "x2"),
+        ("not able", "notable"),
+        ("|x|", "||"),
+    ],
+)
+async def test_citation_normalization_does_not_accept_changed_math_or_words(
+    service, monkeypatch, source_text, quote
+):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.lesson_evidence["kp1"] = {"sources": [{"ref": {}, "text": source_text}]}
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *args, **kwargs: None)
+
+    async def request(*args, **kwargs):
+        return {"supported": True, "citations": [{"index": 0, "quote": quote}]}
+
+    monkeypatch.setattr(semantic, "_request", request)
+    with pytest.raises(semantic.AssessmentUnavailable, match="absent"):
+        await semantic.bind_question(service.store, progress, leaf())
+
+
+def test_same_answer_does_not_make_different_math_a_duplicate():
+    from deeptutor.learning import semantic_assessment as semantic
+
+    prior = leaf(expected="4")
+    prior.prompt = "What is 2+2?"
+    prior.source_evidence = _source_packet("Exercise sheet")
+    candidate = prior.model_copy(deep=True)
+    candidate.prompt = "What is 2*2?"
+    semantic._refuse_restatement(candidate, [prior])
+
+
+def test_repeated_prompt_on_another_objective_or_source_is_allowed():
+    from deeptutor.learning import semantic_assessment as semantic
+
+    prior = leaf(expected="4")
+    prior.source_evidence = _source_packet("First exercise")
+    candidate = prior.model_copy(deep=True)
+    candidate.knowledge_point_id = "another-objective"
+    semantic._refuse_restatement(candidate, [prior])
+    candidate.knowledge_point_id = prior.knowledge_point_id
+    candidate.source_evidence = _source_packet("Another exercise")
+    semantic._refuse_restatement(candidate, [prior])
+
+
+@pytest.mark.asyncio
+async def test_review_stage_can_repeat_an_answered_question(service, monkeypatch):
+    from deeptutor.learning import lesson_evidence
+    from deeptutor.learning import semantic_assessment as semantic
+
+    progress = service.store.load("p")
+    progress.current_stage = "review"
+    progress.lesson_evidence["kp1"] = _source_packet("alpha is the first letter")
+    prior = leaf(expected="alpha")
+    prior.source_evidence = progress.lesson_evidence["kp1"]
+    service.register_question("p", prior)
+    service.grade_interaction("p", answer="alpha", question_id="q1")
+    monkeypatch.setattr(lesson_evidence, "validate_evidence", lambda *a, **kw: None)
+
+    async def support(*a, **kw):
+        return {
+            "supported": True,
+            "citations": [{"index": 0, "quote": "alpha is the first letter"}],
+        }
+
+    monkeypatch.setattr(semantic, "_request", support)
+    await semantic.bind_question(service.store, progress, leaf("review", expected="alpha"))
+
+
+@pytest.mark.asyncio
+async def test_qualitative_reference_survives_grading_persistence_and_replay(service, monkeypatch):
+    from deeptutor.capabilities.mastery import tools
+    from deeptutor.learning import semantic_assessment as semantic
+    from deeptutor.learning.models import KnowledgeType
+
+    def concept(tx):
+        tx.progress.modules[0].knowledge_points[0].type = KnowledgeType.CONCEPT
+        tx.touch()
+
+    service.store.mutate("p", concept)
+    reference = "Alpha is the first letter of the Greek alphabet."
+
+    async def request(config, instruction, payload, **kwargs):
+        assert payload[0]["assessment_type"] == "qualitative"
+        assert "not feedback" in instruction
+        return {
+            "verdicts": [
+                {
+                    "question_id": "kp1",
+                    "result": "correct",
+                    "confidence": 0.99,
+                    "feedback": "Your explanation is accurate.",
+                    "reference_answer": reference,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    monkeypatch.setattr(tools, "_new_service", lambda: service)
+    captured = []
+
+    async def record(value):
+        captured.append(value)
+
+    monkeypatch.setattr("deeptutor.learning.assessment.record_assessment", record)
+    kwargs = dict(
+        _mastery_path_id="p",
+        knowledge_point_id="kp1",
+        _session_id="session",
+        _turn_id="turn",
+        _learner_message="alpha comes first",
+    )
+    for _ in range(2):
+        result = await tools.MasteryAssessTool().execute(**kwargs)
+        assert result.success, result.content
+        assert captured[-1].correct_answer == reference
+        assert captured[-1].user_answer == "alpha comes first"
+    evidence = service.store.load("p").learning_evidence
+    assert len(evidence) == 1
+    assert evidence[0].reference_answer == reference
+    assert evidence[0].feedback != reference
+
+
+@pytest.mark.asyncio
+async def test_final_qualitative_grade_without_reference_is_not_saved(monkeypatch):
+    from deeptutor.learning import semantic_assessment as semantic
+
+    async def request(*args, **kwargs):
+        return {
+            "verdicts": [
+                {
+                    "question_id": "objective",
+                    "result": "correct",
+                    "confidence": 0.99,
+                    "feedback": "Correct.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(semantic, "_request", request)
+    with pytest.raises(semantic.AssessmentUnavailable, match="No grade was saved"):
+        await semantic.judge_answers(
+            None, [{"question_id": "objective", "assessment_type": "qualitative"}]
+        )

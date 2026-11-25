@@ -8,6 +8,7 @@ import {
 import { buildVisiblePath } from "@/lib/message-branches";
 import { initI18n } from "@/i18n/init";
 import { updateRecoveryPrincipal } from "@/lib/recovery-principal";
+import * as notifications from "@/lib/notifications";
 import {
   resetReadingTurnState, setReadingMaterial, setReadingViewport,
   setReadingWorkspace,
@@ -64,6 +65,7 @@ vi.mock("@/features/chat/transport/UnifiedTurnClient", () => ({
       fixture.sent.push(message);
       return Promise.resolve(true);
     }
+    cancelCurrentTurn() { return Promise.resolve(true); }
     setResumeState() {}
   },
 }));
@@ -97,7 +99,13 @@ vi.mock("@/lib/session-api", () => ({
   },
   updateBranchSelection: async () => ({}),
   updateSessionTitle: async () => fixture.session ?? {},
-  updateSessionReplyLanguage: async () => fixture.session ?? {},
+  updateSessionReplyLanguage: async (
+    _sessionId: string,
+    language: string | null,
+  ) => ({
+    ...(fixture.session ?? {}),
+    preferences: { reply_language_override: language },
+  }),
 }));
 
 /** A server transcript: one completed user/assistant exchange. */
@@ -185,6 +193,11 @@ function Harness() {
         if (typeof draft?.id === "number") void editMessage(draft.id, "Second edit");
       }}>Edit second version</button>
       <button onClick={() => {
+        const saved = [...state.messages].reverse().find((message) =>
+          message.role === "user" && !message.failedSubmission && message.requestSnapshot);
+        if (typeof saved?.id === "number") void editMessage(saved.id, "Edited with new settings");
+      }}>Edit saved question</button>
+      <button onClick={() => {
         const draft = state.messages.find((message) => message.failedSubmission);
         if (typeof draft?.id === "number") void retryFailedSubmission(draft.id);
       }}>Retry first unsent</button>
@@ -212,7 +225,7 @@ function Harness() {
       <button onClick={() => {
         configureSession({
           capability: "deep_research", workspaceMode: "immersive_reading",
-          workspaceId: "other-workspace", courseId: "other-course",
+          workspaceId: "other-workspace",
           masteryPathId: "other-path", masterySessionMode: "study",
         });
         setPersonaSelection("other-persona");
@@ -228,6 +241,8 @@ function Harness() {
       <div data-testid="submissionFailed">
         {String(state.submissionFailed)}
       </div>
+      <div data-testid="submissionError">{state.submissionErrorMessage}</div>
+      <div data-testid="submissionNoLlmAccess">{String(state.submissionNoLlmAccess)}</div>
       <div data-testid="lastTurnFailed">{String(state.lastTurnFailed)}</div>
       <div data-testid="capability">{state.activeCapability}</div>
       <div data-testid="submissionNeedsReview">{String(state.submissionNeedsReview)}</div>
@@ -509,7 +524,7 @@ it("preserves a stopped-before-admission draft across reload", async () => {
   render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
   await act(async () => fireEvent.click(screen.getByText("Load")));
   fireEvent.click(screen.getByText("Send"));
-  fireEvent.click(screen.getByText("Stop"));
+  await act(async () => fireEvent.click(screen.getByText("Stop")));
   expect(readMessages().at(-1)).toMatchObject({ content: "Hello offline", failed: true });
   await act(async () => fireEvent.click(screen.getByText("Load")));
   expect(readMessages().at(-1)).toMatchObject({ content: "Hello offline", failed: true });
@@ -864,7 +879,7 @@ it("retries a failed draft with its original settings after live settings change
     await act(async () => { fireEvent.click(screen.getByText("Resend")); });
     expect(fixture.sent.at(-1)).toMatchObject({
       type: "start_turn", content: "Hello offline", capability: null,
-      workspace_mode: "", workspace_id: null, course_id: null,
+      workspace_mode: "", workspace_id: null,
       mastery_path_id: null, mastery_session_mode: null, persona: "",
       llm_selection: null, language: "en", reading_workspace_id: null,
       reading_material_id: null, timed_media_id: null,
@@ -873,6 +888,40 @@ it("retries a failed draft with its original settings after live settings change
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("edits a saved question with the live model and reply language (#2106)", async () => {
+  fixture.session = {
+    ...completedServerSession(),
+    messages: [{
+      id: 7, session_id: "s1", role: "user", content: "Explain binary search",
+      events: [], attachments: [], created_at: 7, parent_message_id: null,
+      metadata: { request_snapshot: {
+        content: "Explain binary search", capability: "chat", language: "en",
+        enabledTools: ["reason"], knowledgeBases: ["kb-1"],
+        llmSelection: { model_id: "model-a", profile_id: "profile-a" },
+      } },
+    }],
+  };
+  fixture.connected = true;
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => { fireEvent.click(screen.getByText("Load")); });
+  await act(async () => { fireEvent.click(screen.getByText("Change live settings")); });
+  await act(async () => { fireEvent.click(screen.getByText("Edit saved question")); });
+  const sent = fixture.sent.at(-1) as Record<string, unknown>;
+  // The question's material context carries over to the new branch…
+  expect(sent).toMatchObject({
+    type: "start_turn", content: "Edited with new settings",
+    capability: "chat", tools: ["reason"], knowledge_bases: ["kb-1"],
+  });
+  // …but the model and reply language are the ones picked after it was saved.
+  expect(sent).toMatchObject({
+    llm_selection: { model_id: "other-model", profile_id: "other-profile" },
+    language: "zh",
+  });
+  // The session already carries its language as a server-side preference, so
+  // only the resolved answer language travels with the turn.
+  expect(sent).not.toHaveProperty("reply_language_override");
 });
 
 it("retries the original reading viewport after the live document changes", async () => {
@@ -916,7 +965,7 @@ it("Stop before admission cannot erase another tab's newer same-ID retry", async
       capability: original?.capability,
       requestSnapshot: original?.requestSnapshot,
     });
-    fireEvent.click(screen.getByText("Stop"));
+    await act(async () => fireEvent.click(screen.getByText("Stop")));
     expect(readFailedSubmission("draft:general")?.submissionId)
       .toBe(original?.submissionId);
     expect(screen.getByTestId("submissionFailed").textContent).toBe("true");
@@ -967,6 +1016,7 @@ it("restores the failed draft when /chat remounts under the same provider", () =
 });
 
 it("keeps a start_turn_rejected submission as an unsent user row across reload", async () => {
+  const notify = vi.spyOn(notifications, "notify");
   fixture.connected = true;
   fixture.session = completedServerSession();
   const firstView = render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
@@ -983,6 +1033,7 @@ it("keeps a start_turn_rejected submission as an unsent user row across reload",
     role: "user", content: "Hello offline", failed: true,
   });
   expect(readFailedSubmissions("s1")).toHaveLength(1);
+  expect(notify).toHaveBeenCalledWith("Turn rejected", expect.objectContaining({ tone: "error" }));
   firstView.unmount();
   render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
   await act(async () => { fireEvent.click(screen.getByText("Load")); });
@@ -990,6 +1041,120 @@ it("keeps a start_turn_rejected submission as an unsent user row across reload",
     role: "user", content: "Hello offline", failed: true,
   });
   expect(screen.getByTestId("lastTurnFailed").textContent).toBe("true");
+});
+
+it("carries the server's rejection text into the submission banner state (#2637)", async () => {
+  fixture.connected = true;
+  fixture.session = completedServerSession();
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => { fireEvent.click(screen.getByText("Load")); });
+  fireEvent.click(screen.getByText("Send"));
+  await act(async () => {
+    fixture.emit?.({
+      type: "error", source: "transport", stage: "",
+      content: "No LLM model is assigned to your account. Please contact an administrator.",
+      timestamp: Date.now() / 1000,
+      metadata: { reason: "start_turn_rejected", turn_terminal: true, status: "failed" },
+    });
+  });
+  expect(screen.getByTestId("submissionFailed").textContent).toBe("true");
+  // The server's own explanation reaches the banner state, so the composer-
+  // adjacent banner shows the reason instead of a network claim.
+  expect(screen.getByTestId("submissionError").textContent).toBe(
+    "No LLM model is assigned to your account. Please contact an administrator.",
+  );
+  // The transport give-up path keeps its connection copy as the row text.
+  fixture.connected = false;
+  vi.useFakeTimers();
+  fireEvent.click(screen.getByText("Send"));
+  await act(async () => { await vi.advanceTimersByTimeAsync(GIVE_UP_MS); });
+  expect(readMessages().at(-1)?.failed).toBe(true);
+  expect(screen.getByTestId("submissionError").textContent).toBe(
+    "Couldn't reach the server. Please check your connection and retry.",
+  );
+  vi.useRealTimers();
+});
+
+it.each(["Resend", "Retry first unsent"])("keeps model-access failure across reload and rechecks on explicit %s", async (retryLabel) => {
+  const notify = vi.spyOn(notifications, "notify");
+  fixture.connected = true;
+  fixture.session = completedServerSession();
+  const first = render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => fireEvent.click(screen.getByText("Load")));
+  await act(async () => fireEvent.click(screen.getByText("Send")));
+  await act(async () => {
+    fixture.emit?.({
+      type: "error", source: "transport", stage: "", content: "Ask an administrator",
+      timestamp: Date.now() / 1000,
+      metadata: { reason: "no_llm_access", retryable: false, turn_terminal: true, status: "failed" },
+    });
+  });
+  expect(readMessages().at(-1)).toEqual({
+    role: "user", content: "Hello offline", failed: true,
+  });
+  expect(screen.getByTestId("submissionNoLlmAccess").textContent).toBe("true");
+  expect(notify).not.toHaveBeenCalledWith("Ask an administrator", expect.anything());
+  first.unmount();
+
+  fixture.sent = [];
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => fireEvent.click(screen.getByText("Load")));
+  expect(screen.getByTestId("submissionNoLlmAccess").textContent).toBe("true");
+  expect(readFailedSubmissions("s1")[0].noLlmAccess).toBe(true);
+  // Reload never automatically resubmits an authorization failure. A manual
+  // retry reaches the server, which may now have a restored model assignment.
+  expect(fixture.sent.filter(message => message.type === "start_turn")).toHaveLength(0);
+  await act(async () => fireEvent.click(screen.getByText(retryLabel)));
+  expect(fixture.sent.filter(message => message.type === "start_turn")).toHaveLength(1);
+  expect(screen.getByTestId("submissionNoLlmAccess").textContent).toBe("false");
+  expect(readFailedSubmissions("s1").some(record => record.noLlmAccess)).toBe(false);
+});
+
+it("retries the original wire request after reload even when the transcript advances", async () => {
+  fixture.connected = true;
+  fixture.session = completedServerSession();
+  const first = render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => fireEvent.click(screen.getByText("Load")));
+  await act(async () => fireEvent.click(screen.getByText("Send")));
+  const original = structuredClone(fixture.sent.find(message => message.type === "start_turn")!);
+  expect(original.parent_message_id).toBe(2);
+  expect(readFailedSubmissions("s1")[0].requestSnapshot).toMatchObject({ submissionRequest: original });
+  first.unmount();
+  const messages = fixture.session.messages as Array<Record<string, unknown>>;
+  messages.push(
+    { ...messages[0], id: 3, content: "Another tab's question", parent_message_id: 2 },
+    { ...messages[1], id: 4, content: "Another answer", parent_message_id: 3 },
+  );
+  fixture.sent = [];
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => fireEvent.click(screen.getByText("Load")));
+  await act(async () => fireEvent.click(screen.getByText("Retry first unsent")));
+  expect(fixture.sent.find(message => message.type === "start_turn")).toEqual(original);
+  expect(fixture.replacementCalls).toHaveLength(0);
+});
+
+it.each(["Hello offline", ""])("recovers legacy draft %j by fencing its old ID before retrying", async (content) => {
+  fixture.connected = true;
+  fixture.session = completedServerSession();
+  storeFailedSubmission("s1", { content, requestSnapshot: {
+    content, capability: "chat", enabledTools: [], knowledgeBases: [], language: "en",
+    attachments: [{ type: "image", base64: "YWJj", filename: "source.png" }],
+  } });
+  const originalId = readFailedSubmissions("s1")[0].submissionId;
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => fireEvent.click(screen.getByText("Load")));
+  await act(async () => fireEvent.click(screen.getByText("Retry first unsent")));
+  expect(fixture.replacementCalls).toHaveLength(1);
+  expect(fixture.replacementCalls[0].original).toBe(originalId);
+  expect(fixture.replacementCalls[0].request.content).toBe(content);
+  expect(fixture.replacementCalls[0].request.attachments).toEqual([
+    { type: "image", base64: "YWJj", filename: "source.png" },
+  ]);
+  expect(fixture.replacementCalls[0].request.client_submission_id).not.toBe(originalId);
+  expect(fixture.sent).toEqual([{ type: "subscribe_turn", turn_id: "edited-turn", after_seq: 0 }]);
+  expect(readFailedSubmissions("s1").map(record => record.submissionId)).toEqual([
+    fixture.replacementCalls[0].request.client_submission_id,
+  ]);
 });
 
 it("keeps both unsent messages when a second direct send fails", async () => {
@@ -1655,4 +1820,75 @@ it("preserves an original unsent draft when the backend lacks atomic replacement
   expect(fixture.sent).toEqual([]);
   expect(readFailedSubmissions("s1")).toEqual(before);
   expect(readMessages().some(message => message.content === "Original unsupported draft")).toBe(true);
+});
+
+it("resends a saved failed turn with the model and reply language selected now", async () => {
+  fixture.session = {
+    ...completedServerSession(),
+    status: "failed",
+    messages: [{
+      id: 3,
+      session_id: "s1",
+      role: "user",
+      content: "B",
+      events: [],
+      attachments: [],
+      created_at: 3,
+      parent_message_id: null,
+      metadata: {
+        request_snapshot: {
+          content: "B",
+          capability: "chat",
+          language: "en",
+          llmSelection: { model_id: "model-a", profile_id: "profile-a" },
+        },
+      },
+    }, {
+      id: 4,
+      session_id: "s1",
+      role: "assistant",
+      content: "the turn failed",
+      events: [],
+      attachments: [],
+      created_at: 4,
+      parent_message_id: 3,
+    }],
+  };
+  fixture.connected = true;
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => { fireEvent.click(screen.getByText("Load")); });
+  // The server echoes the persisted reply-language preference.
+  (fixture.session.preferences as Record<string, unknown>).reply_language_override = "zh";
+  await act(async () => { fireEvent.click(screen.getByText("Change live settings")); });
+  await act(async () => { fireEvent.click(screen.getByText("Resend")); });
+  expect(fixture.sent.at(-1)).toMatchObject({
+    type: "regenerate",
+    session_id: "s1",
+    overrides: {
+      replay_snapshot: true,
+      llm_selection: { model_id: "other-model", profile_id: "other-profile" },
+      language: "zh",
+    },
+  });
+});
+
+it("keeps the original settings when an unsent message is edited", async () => {
+  fixture.session = completedServerSession();
+  fixture.connected = true;
+  storeFailedSubmission("s1", { submissionId: "original-edit", content: "Original", requestSnapshot: {
+    content: "Original", capability: "chat", language: "en",
+    llmSelection: { model_id: "model-a", profile_id: "profile-a" },
+    enabledTools: [], knowledgeBases: [],
+  } });
+  render(<ChatStateAdapterProvider><Harness /></ChatStateAdapterProvider>);
+  await act(async () => { fireEvent.click(screen.getByText("Load")); });
+  await act(async () => { fireEvent.click(screen.getByText("Change live settings")); });
+  await act(async () => { fireEvent.click(screen.getByText("Edit first unsent")); });
+  expect(fixture.replacementCalls).toHaveLength(1);
+  // An unsent submission keeps its own parameters: its submission id may
+  // already be reserved, and a changed request would no longer match it.
+  expect(fixture.replacementCalls[0].request).toMatchObject({
+    llm_selection: { model_id: "model-a", profile_id: "profile-a" },
+    language: "en",
+  });
 });

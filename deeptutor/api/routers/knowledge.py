@@ -41,6 +41,7 @@ from deeptutor.api.routers.auth import require_admin
 from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
 from deeptutor.api.utils.task_id_manager import TaskIDManager
 from deeptutor.api.utils.task_log_stream import capture_task_logs, get_task_stream_manager
+from deeptutor.core.errors import AccessError
 from deeptutor.knowledge.add_documents import (
     DocumentAdder,
     _bootstrap_index_from_files,
@@ -80,7 +81,6 @@ from deeptutor.services.rag.factory import (
     normalize_provider_name,
     provider_uses_embedding_versions,
 )
-from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.services.rag.linked_kb import (
     LINKABLE_PROVIDERS,
     assert_path_allowed,
@@ -101,6 +101,7 @@ from deeptutor.services.rag.pipelines.ima.config import (
 from deeptutor.services.rag.visual_assets import VisualAssetStore
 from deeptutor.services.web_source.scheduler import get_web_source_sync_scheduler
 from deeptutor.services.workspace.knowledge import workspace_id_for_kb_base_dir
+from deeptutor.services.workspace.models import WorkspaceError
 from deeptutor.utils.document_extractor import (
     MAX_EXTRACTED_CHARS_PER_DOC,
     DocumentExtractionError,
@@ -109,6 +110,7 @@ from deeptutor.utils.document_extractor import (
 )
 from deeptutor.utils.document_validator import DocumentValidator
 from deeptutor.utils.error_utils import format_exception_message
+from deeptutor.utils.file_types import FileTypeRouter
 
 # Initialize logger with config
 config = load_config_with_main("main.yaml", PROJECT_ROOT)
@@ -147,6 +149,41 @@ def get_kb_manager():
     if kb_manager is not None:
         return kb_manager
     return current_kb_manager()
+
+
+@contextmanager
+def _connected_kb_registration(name: str):
+    """Register a connected KB in the workspace viewing the library."""
+    from contextlib import nullcontext
+
+    from deeptutor.services.workspace.context import current_workspace_id, workspace_context
+    from deeptutor.services.workspace.knowledge import (
+        canonical_kb_id,
+        library_request,
+        library_viewer,
+        qualified_kb_id,
+    )
+    from deeptutor.services.workspace.models import WorkspaceError
+
+    viewer = library_viewer.get() if library_request.get() else None
+    try:
+        with workspace_context(viewer) if viewer is not None else nullcontext() as scope:
+            if scope is not None and scope.archived:
+                raise WorkspaceError(
+                    "Restore the storage workspace before creating a knowledge base."
+                )
+            token = library_request.set(False) if viewer is not None else None
+            try:
+                workspace_id = "" if library_request.get() else current_workspace_id()
+                resource_id = qualified_kb_id(validate_knowledge_base_name(name), workspace_id)
+                if canonical_kb_id(resource_id) != resource_id:
+                    raise WorkspaceError("This knowledge base ID is reserved by an earlier move.")
+                yield get_kb_manager(), resource_id
+            finally:
+                if token is not None:
+                    library_request.reset(token)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _overridden_kb_manager() -> KnowledgeBaseManager | None:
@@ -358,6 +395,18 @@ def _save_zip_archive(
             raise HTTPException(
                 status_code=400,
                 detail=f"'{sanitized_filename}' is not a valid zip archive.",
+            ) from exc
+        except FileExistsError as exc:
+            # The extractor refuses to replace a document the KB already holds.
+            # Name the member only: the OS error carries the server's path.
+            existing = Path(exc.filename or "").name or "a file"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Archive '{sanitized_filename}' contains '{existing}', which is "
+                    "already in this knowledge base. Rename it in the archive or "
+                    "remove the existing document, then upload again."
+                ),
             ) from exc
 
         if not result.extracted:
@@ -1809,7 +1858,7 @@ async def update_lightrag_pipeline_config(payload: LightRagConfigUpdate):
         return service.save_lightrag(candidate)
     except (ValueError, PermissionError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error updating LightRAG config: {e}")
@@ -2059,7 +2108,7 @@ async def set_rag_active_model(payload: ActiveModelUpdate):
         svc["active_model_id"] = payload.model_id
         service.apply(catalog)
         return _model_options_payload([payload.kind])[payload.kind]
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error setting active model: {e}")
@@ -2069,8 +2118,9 @@ async def set_rag_active_model(payload: ActiveModelUpdate):
 @router.get("/knowledge-bases/supported-file-types", response_model=SupportedFileTypesInfo)
 async def get_supported_file_types():
     """Return the current upload policy so the web client stays in sync."""
-    allow_any_extension = FileTypeRouter.active_parser_accepts_any_format()
-    extensions = [] if allow_any_extension else sorted(FileTypeRouter.get_supported_extensions())
+    accepted = FileTypeRouter.accepted_upload_extensions()
+    allow_any_extension = not accepted
+    extensions = sorted(accepted)
     accept_items = (
         []
         if allow_any_extension
@@ -2171,7 +2221,7 @@ async def update_kb_config(kb_name: str, config: dict):
 
         service.set_kb_config(kb_name, config)
         return {"status": "success", "kb_name": kb_name, "config": service.get_kb_config(kb_name)}
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error updating config for KB '{kb_name}': {e}")
@@ -2216,7 +2266,7 @@ async def set_default_kb(kb_name: str):
 
         manager.set_default(kb_name)
         return {"status": "success", "default_kb": kb_name}
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error setting default KB: {e}")
@@ -2242,13 +2292,18 @@ async def connect_obsidian_vault(payload: ConnectObsidianRequest):
         raise HTTPException(status_code=400, detail="Both name and vault_path are required.")
     try:
         folder = assert_path_allowed(vault_path)
-        manager = get_kb_manager()
-        entry = manager.register_obsidian_vault(name, str(folder))
-        return {"status": "connected", "name": name, "vault_path": entry["vault_path"]}
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_obsidian_vault(name, str(folder))
+        return {
+            "status": "connected",
+            "id": resource_id,
+            "name": name,
+            "vault_path": entry["vault_path"],
+        }
     except ValueError as e:
         # Missing/invalid path, disallowed location, or a name clash → 400.
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error connecting Obsidian vault: {e}")
@@ -2273,18 +2328,20 @@ async def connect_marginnote4(payload: ConnectMarginNote4Request):
     if not name:
         raise HTTPException(status_code=400, detail="name is required.")
     try:
-        manager = get_kb_manager()
-        entry = manager.register_marginnote4_kb(
-            name,
-            db_path=(payload.db_path or "").strip(),
-            description=(payload.description or "").strip(),
-        )
-        result = {"status": "connected", "name": name}
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_marginnote4_kb(
+                name,
+                db_path=(payload.db_path or "").strip(),
+                description=(payload.description or "").strip(),
+            )
+        result = {"status": "connected", "id": resource_id, "name": name}
         if entry.get("db_path"):
             result["db_path"] = entry["db_path"]
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (HTTPException, AccessError):
+        raise
     except Exception as e:
         logger.error(f"Error connecting MarginNote 4 library: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2347,16 +2404,16 @@ async def connect_linked_folder_route(payload: ConnectFolderRequest):
         "doc_count": result.doc_count,
     }
     try:
-        manager = get_kb_manager()
-        entry = manager.register_linked_kb(
-            name,
-            str(folder),
-            result.provider,
-            stats=stats,
-        )
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_linked_kb(
+                name,
+                str(folder),
+                result.provider,
+                stats=stats,
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error connecting linked folder: {e}")
@@ -2364,6 +2421,7 @@ async def connect_linked_folder_route(payload: ConnectFolderRequest):
 
     return {
         "status": "connected",
+        "id": resource_id,
         "name": name,
         "external_path": entry["external_path"],
         "rag_provider": entry["rag_provider"],
@@ -2457,16 +2515,16 @@ async def connect_lightrag_server_route(payload: ConnectLightRagServerRequest):
         search_mode = ""
 
     try:
-        manager = get_kb_manager()
-        entry = manager.register_lightrag_server_kb(
-            name,
-            result.base_url,
-            api_key=api_key,
-            search_mode=search_mode,
-        )
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_lightrag_server_kb(
+                name,
+                result.base_url,
+                api_key=api_key,
+                search_mode=search_mode,
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error connecting LightRAG server: {e}")
@@ -2474,6 +2532,7 @@ async def connect_lightrag_server_route(payload: ConnectLightRagServerRequest):
 
     return {
         "status": "connected",
+        "id": resource_id,
         "name": name,
         "server_url": entry["server_url"],
         "rag_provider": entry["rag_provider"],
@@ -2526,16 +2585,16 @@ async def connect_weknora_route(payload: ConnectWeKnoraRequest):
         )
 
     try:
-        manager = get_kb_manager()
-        entry = manager.register_weknora_kb(
-            name,
-            result.base_url,
-            payload.api_key or "",
-            result.knowledge_base_id,
-        )
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_weknora_kb(
+                name,
+                result.base_url,
+                payload.api_key or "",
+                result.knowledge_base_id,
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Error connecting WeKnora knowledge base: {e}")
@@ -2543,6 +2602,7 @@ async def connect_weknora_route(payload: ConnectWeKnoraRequest):
 
     return {
         "status": "connected",
+        "id": resource_id,
         "name": name,
         "server_url": entry["server_url"],
         "knowledge_base_id": entry["knowledge_base_id"],
@@ -2676,17 +2736,18 @@ async def connect_kiwix_route(payload: ConnectKiwixRequest) -> dict[str, Any]:
     try:
         client = KiwixClient(payload.server_url, payload.zim_name)
         title = await client.probe()
-        manager = get_kb_manager()
-        entry = manager.register_kiwix_kb(
-            payload.name,
-            client.base_url,
-            client.zim_name,
-            zim_title=title,
-        )
+        with _connected_kb_registration(payload.name) as (manager, resource_id):
+            entry = manager.register_kiwix_kb(
+                payload.name,
+                client.base_url,
+                client.zim_name,
+                zim_title=title,
+            )
     except (KiwixError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "status": "connected",
+        "id": resource_id,
         "name": payload.name,
         "zim_name": entry["zim_name"],
         "title": entry["zim_title"],
@@ -2775,17 +2836,17 @@ async def connect_ima_route(payload: ConnectImaRequest):
         )
 
     try:
-        manager = get_kb_manager()
-        entry = manager.register_ima_kb(
-            name,
-            overrides.client_id,
-            overrides.api_key,
-            payload.knowledge_base_id,
-            description=result.description or "",
-        )
+        with _connected_kb_registration(name) as (manager, resource_id):
+            entry = manager.register_ima_kb(
+                name,
+                overrides.client_id,
+                overrides.api_key,
+                payload.knowledge_base_id,
+                description=result.description or "",
+            )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as exc:
         # Never echo or log an upstream message from this credential-bearing
@@ -2795,6 +2856,7 @@ async def connect_ima_route(payload: ConnectImaRequest):
 
     return {
         "status": "connected",
+        "id": resource_id,
         "name": name,
         "knowledge_base_id": entry["knowledge_base_id"],
         "rag_provider": entry["rag_provider"],
@@ -3017,7 +3079,7 @@ def _list_knowledge_bases():
                         )
                     )
         return result
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         error_msg = f"Error listing knowledge bases: {e}"
@@ -3058,9 +3120,9 @@ async def get_knowledge_base_details(kb_name: str):
         if resource.assigned:
             info.pop("path", None)
         return info
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
@@ -3384,7 +3446,7 @@ def _delete_kb(kb_name: str) -> dict[str, str]:
     try:
         manager, resolved_name, _ = _writable_kb(kb_name)
         success = manager.delete_knowledge_base(resolved_name, confirm=True)
-    except HTTPException:
+    except (HTTPException, AccessError):
         # Re-raised before the catch-all below, which used to turn a 404 from
         # ``_writable_kb`` into a 500 whose detail read "404: ... not found".
         raise
@@ -3462,6 +3524,11 @@ async def upload_files(
     """
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
+        # Resolve the storage scope before copying anything or marking the KB
+        # queued: this lookup walks the workspace catalog and may fail, and a
+        # failure here must not leave a "queued" progress entry whose
+        # background task was never registered.
+        storage_workspace_id = workspace_id_for_kb_base_dir(kb_base_dir)
         requested_provider = None
         if rag_provider is not None and str(rag_provider).strip():
             requested_provider = _validate_registered_provider(rag_provider)
@@ -3499,11 +3566,7 @@ async def upload_files(
                 kb_name, kb_base_dir, kb_provider, image_analysis
             )
         _enforce_provider_formats(kb_provider, files)
-        allowed_extensions = (
-            set()
-            if FileTypeRouter.active_parser_accepts_any_format()
-            else FileTypeRouter.get_supported_extensions()
-        )
+        allowed_extensions = FileTypeRouter.accepted_upload_extensions()
         # ``.zip`` is accepted as an upload container; its members are
         # validated against ``allowed_extensions`` during extraction and the
         # archive itself is never indexed (``safe_extract_zip`` skips ``.zip``).
@@ -3537,7 +3600,7 @@ async def upload_files(
             task_id=task_id,
             rag_provider=kb_provider,
             owner=get_current_user(),
-            storage_workspace_id=workspace_id_for_kb_base_dir(kb_base_dir),
+            storage_workspace_id=storage_workspace_id,
         )
 
         return {
@@ -3545,8 +3608,11 @@ async def upload_files(
             "files": uploaded_files,
             "task_id": task_id,
         }
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
+    except WorkspaceError as exc:
+        # A workspace problem is not a missing knowledge base; keep the reason.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
     except Exception as e:
@@ -3706,11 +3772,7 @@ async def _create_knowledge_base_owned(
                     ),
                 )
         _enforce_provider_formats(rag_provider, files)
-        allowed_extensions = (
-            set()
-            if FileTypeRouter.active_parser_accepts_any_format()
-            else FileTypeRouter.get_supported_extensions()
-        )
+        allowed_extensions = FileTypeRouter.accepted_upload_extensions()
         _validate_upload_batch(files, allowed_extensions=allowed_extensions, rel_paths=rel_paths)
 
         logger.info(f"Creating KB: {name} (provider={rag_provider})")
@@ -3838,7 +3900,7 @@ async def _create_knowledge_base_owned(
             "task_id": task_id,
         }
 
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Failed to create KB: {e}")
@@ -4162,6 +4224,8 @@ async def reindex_knowledge_base(
     """
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
+        # See upload_files(): resolve the destination scope before queueing.
+        storage_workspace_id = workspace_id_for_kb_base_dir(kb_base_dir)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
         _assert_not_connected_kb(kb_name, kb_entry)
         force_reindex = str(kb_entry.get("status") or "").lower() == "error"
@@ -4304,7 +4368,7 @@ async def reindex_knowledge_base(
             signature_hash=signature_hash,
             indexing_snapshot=indexing_snapshot,
             owner=get_current_user(),
-            storage_workspace_id=workspace_id_for_kb_base_dir(kb_base_dir),
+            storage_workspace_id=storage_workspace_id,
             **(
                 {"embedding_selection": embedding_selection, "embedding_config": embedding_config}
                 if embedding_selection
@@ -4318,7 +4382,7 @@ async def reindex_knowledge_base(
             "signature": signature_hash,
             "noop": False,
         }
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Failed to start reindex for '{kb_name}': {e}")
@@ -4367,7 +4431,7 @@ async def retry_knowledge_base(
         return await reindex_knowledge_base(
             kb_name, background_tasks, indexing_llm="", config_fingerprint="", embedding_model=""
         )
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         logger.error(f"Failed to retry KB '{kb_name}': {e}")
@@ -4439,7 +4503,7 @@ async def get_progress(kb_name: str):
             return {"status": "not_started", "message": "Initialization not started"}
 
         return progress
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -4453,7 +4517,7 @@ async def clear_progress(kb_name: str):
         progress_tracker = ProgressTracker(resolved_name, base_dir)
         progress_tracker.clear()
         return {"status": "success", "message": f"Progress cleared for {kb_name}"}
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -4779,7 +4843,7 @@ async def link_folder(kb_name: str, request: LinkFolderRequest):
         folder_info = manager.link_folder(resolved_name, request.folder_path)
         logger.info(f"Linked folder '{request.folder_path}' to KB '{kb_name}'")
         return LinkedFolderInfo(**folder_info)
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except ValueError as e:
         error_msg = str(e)
@@ -4798,7 +4862,7 @@ async def get_linked_folders(kb_name: str):
         manager = manager_for_resource(resource)
         folders = manager.get_linked_folders(resource.name)
         return [LinkedFolderInfo(**f) for f in folders]
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
@@ -4817,7 +4881,7 @@ async def unlink_folder(kb_name: str, folder_id: str):
             raise HTTPException(status_code=404, detail=f"Folder '{folder_id}' not found")
         logger.info(f"Unlinked folder '{folder_id}' from KB '{kb_name}'")
         return {"message": "Folder unlinked successfully", "folder_id": folder_id}
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
@@ -4838,6 +4902,9 @@ async def sync_folder(kb_name: str, folder_id: str, background_tasks: Background
     """
     try:
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
+        # See upload_files(): resolve the destination scope before queueing so a
+        # failing lookup cannot leave a task-less "starting" progress entry.
+        storage_workspace_id = workspace_id_for_kb_base_dir(kb_base_dir)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
         _assert_kb_writable_or_409(kb_name, kb_entry)
         kb_provider = _validate_registered_provider(
@@ -4902,7 +4969,7 @@ async def sync_folder(kb_name: str, folder_id: str, background_tasks: Background
             folder_id=folder_id,  # Pass folder_id to update state on success
             folder_root=folder_path,  # Preserve each file's path relative to this root
             owner=get_current_user(),
-            storage_workspace_id=workspace_id_for_kb_base_dir(kb_base_dir),
+            storage_workspace_id=storage_workspace_id,
         )
 
         return SyncFolderResponse(
@@ -4914,8 +4981,10 @@ async def sync_folder(kb_name: str, folder_id: str, background_tasks: Background
             file_count=len(files_to_process),
             task_id=task_id,
         )
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Knowledge base '{kb_name}' not found")
     except Exception as e:
@@ -5001,7 +5070,7 @@ def _knowledge_source_errors(kb_name: str, *, validation_status: int = 404):
     """Translate source-service failures without duplicating route ladders."""
     try:
         yield
-    except HTTPException:
+    except (HTTPException, AccessError):
         raise
     except ValueError as exc:
         detail = str(exc)

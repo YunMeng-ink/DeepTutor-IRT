@@ -33,6 +33,7 @@ from deeptutor.runtime.home import (
 from deeptutor.runtime.memory_probe import SUPERVISOR_PID_ENV
 from deeptutor.runtime.process import is_process_alive
 from deeptutor.services.app_update import LAUNCHER_PID_ENV
+from deeptutor.utils.console_encoding import relax_console_encoding as _relax_console_encoding
 
 BACKEND_READY_TIMEOUT_ENV = "DEEPTUTOR_BACKEND_READY_TIMEOUT"
 FRONTEND_READY_TIMEOUT_ENV = "DEEPTUTOR_FRONTEND_READY_TIMEOUT"
@@ -63,6 +64,8 @@ BACKEND_READY_TIMEOUT = _ready_timeout(BACKEND_READY_TIMEOUT_ENV, 60)
 FRONTEND_READY_TIMEOUT = _ready_timeout(FRONTEND_READY_TIMEOUT_ENV, 120)
 FRONTEND_REUSE_PROBE_TIMEOUT = 2
 KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+SHUTDOWN_GRACE_SECONDS = 3.0
+SHUTDOWN_REAP_SECONDS = 1.0
 WEB_CACHE_DIR = Path("data") / "user" / "runtime" / "web"
 SOURCE_PRODUCTION_DIST_DIR = ".next-deeptutor"
 SOURCE_BUILD_MARKER = ".deeptutor-build.json"
@@ -231,6 +234,7 @@ def _send_tree_signal(pid: int | None, pgid: int | None, sig: signal.Signals | i
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=SHUTDOWN_REAP_SECONDS,
             **_no_window_kwargs(),
         )
         # Exit code 128 is taskkill's "process not found": the tree is
@@ -272,44 +276,134 @@ def _signal_target(
         )
 
 
-def _terminate(proc: ManagedProcess | None) -> None:
-    """Stop ``proc`` with the SIGTERM -> SIGKILL ladder.
-
-    A signal that could not be delivered is logged rather than silently
-    dropped, so a surviving child can be traced back to its failed
-    termination.
-    """
-    if proc is None or proc.process.poll() is not None:
-        return
-    _log(_t("start.stopping", name=proc.name, pid=proc.process.pid))
-    target = f"{proc.name} (pid={proc.process.pid})"
-    _signal_target(proc.process.pid, proc.pgid, signal.SIGTERM, target=target)
+def _group_alive(proc: ManagedProcess) -> bool:
+    """A group can outlive its leader (npm and worker launchers do this)."""
+    if os.name == "nt" or proc.pgid is None:
+        return False
     try:
-        proc.process.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        _signal_target(proc.process.pid, proc.pgid, KILL_SIGNAL, target=target)
+        os.killpg(proc.pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
-def _relax_console_encoding(streams: tuple[object, ...] | None = None) -> None:
-    """Make the launcher's own console output lossy instead of fatal.
+def _terminate_all(
+    processes: list[ManagedProcess], *, force: threading.Event | None = None
+) -> None:
+    """Stop owned trees together, with one grace period and bounded reaping.
 
-    Child pipes are already decoded with ``errors="replace"`` (see ``_spawn``)
-    and the children themselves get ``PYTHONIOENCODING=utf-8:replace``, but the
-    parent process re-encodes every relayed line with the console's own codec.
-    On a legacy Windows code page (cp950/cp936/cp932) an ordinary Next.js
-    banner character like ``✓`` then raises ``UnicodeEncodeError`` inside
-    ``_stream_output``, killing the relay thread — the app keeps running but
-    goes silent for the rest of the session (issue #702).
+    Capture descendants before signalling their parents: tool subprocesses can
+    have their own sessions and become reparented as soon as the backend exits.
+    psutil's Process objects guard against PID reuse when signalling them.
+    Reused frontends are deliberately absent from ``processes``.
     """
-    for stream in streams if streams is not None else (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
+    import psutil
+
+    descendants: dict[int, psutil.Process] = {}
+    parents: list[psutil.Process] = []
+
+    def remember_children(parent: psutil.Process) -> None:
         try:
-            reconfigure(errors="replace")
-        except (ValueError, OSError):
-            # Already-detached or non-reconfigurable stream: nothing to relax.
-            continue
+            for child in parent.children(recursive=True):
+                descendants.setdefault(child.pid, child)
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error:
+            logger.warning("Could not enumerate children of pid=%s", parent.pid, exc_info=True)
+
+    def child_alive(child: psutil.Process) -> bool:
+        try:
+            return child.is_running() and child.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            # Still attempt termination; signal failures are logged below.
+            return True
+
+    active = []
+    for proc in processes:
+        running = proc.process.poll() is None
+        if running:
+            try:
+                parent = psutil.Process(proc.process.pid)
+                parents.append(parent)
+                remember_children(parent)
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                logger.warning("Could not inspect %s", proc.name, exc_info=True)
+        if running or _group_alive(proc):
+            active.append(proc)
+            if not running and os.name != "nt":
+                # Recover same-group children even when the launcher has
+                # already reaped npm or another short-lived parent.
+                for child in psutil.process_iter():
+                    try:
+                        if os.getpgid(child.pid) == proc.pgid:
+                            descendants.setdefault(child.pid, child)
+                            remember_children(child)
+                    except (ProcessLookupError, PermissionError):
+                        continue
+            _log(_t("start.stopping", name=proc.name, pid=proc.process.pid))
+
+    def signal_trees(sig: signal.Signals | int) -> None:
+        for proc in active:
+            _signal_target(
+                proc.process.pid,
+                proc.pgid,
+                sig,
+                target=f"{proc.name} (pid={proc.process.pid})",
+            )
+        for child in descendants.values():
+            try:
+                child.send_signal(sig)
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                logger.warning("Could not signal child pid=%s", child.pid, exc_info=True)
+
+    def pending() -> bool:
+        for parent in parents:
+            if parent.is_running():
+                remember_children(parent)
+        # poll() also reaps direct children after SIGKILL.
+        roots_alive = any([proc.process.poll() is None for proc in active])
+        children_alive = False
+        for child in list(descendants.values()):
+            if child_alive(child):
+                children_alive = True
+                remember_children(child)
+        return roots_alive or children_alive
+
+    if not active and not descendants:
+        return
+    wake = force if force is not None else threading.Event()
+    signal_trees(signal.SIGTERM)
+    deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+    while pending() and not wake.is_set() and time.monotonic() < deadline:
+        wake.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+    if pending() or any(_group_alive(proc) for proc in active):
+        signal_trees(KILL_SIGNAL)
+        # One shared deadline, rather than a timeout for each child.
+        deadline = time.monotonic() + SHUTDOWN_REAP_SECONDS
+        for proc in active:
+            try:
+                proc.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Process did not exit after kill: %s (pid=%s)", proc.name, proc.process.pid
+                )
+        remaining = [child for child in descendants.values() if child_alive(child)]
+        _, alive = psutil.wait_procs(remaining, timeout=max(0.0, deadline - time.monotonic()))
+        if alive:
+            logger.warning("Child processes did not exit after kill: %s", [p.pid for p in alive])
+
+
+def _terminate(proc: ManagedProcess | None) -> None:
+    if proc is not None:
+        _terminate_all([proc])
 
 
 def _stream_output(prefix: str, process: subprocess.Popen[str]) -> None:
@@ -576,6 +670,11 @@ def _owned_orphan_started_at(
         if supervisor <= 0 or _is_pid_alive(supervisor):
             return None
         if role == "start.backend":
+            # Framework Python on macOS runs Python.app after entering through
+            # the sys.executable launcher. Compare actual process executables
+            # on both sides so that our own backend is not mistaken for a
+            # foreign interpreter.
+            interpreter = Path(psutil.Process().exe()).resolve()
             # Multiprocess uvicorn workers have spawn command lines; their
             # parent carries the exact application command and interpreter.
             for candidate in [process, *process.parents()]:
@@ -587,7 +686,7 @@ def _owned_orphan_started_at(
                     for i in range(len(args) - 2)
                 ):
                     if (
-                        Path(candidate.exe()).resolve() == Path(sys.executable).resolve()
+                        Path(candidate.exe()).resolve() == interpreter
                         and Path(candidate.cwd()).resolve() == runtime_home.resolve()
                     ):
                         return process.create_time()
@@ -1255,6 +1354,7 @@ def _launch_detached(
     env[DEEPTUTOR_HOME_ENV] = str(runtime_home.resolve())
     env[DETACHED_WORKER_ENV] = "1"
     env[DETACHED_TOKEN_ENV] = token
+    env["PYTHONSAFEPATH"] = "1"
     kwargs: dict[str, Any] = {
         "cwd": str(runtime_home),
         "env": env,
@@ -1264,9 +1364,11 @@ def _launch_detached(
         "shell": False,
     }
     if sys.platform == "win32":
+        # A venv redirector's interpreter child must inherit a hidden console;
+        # DETACHED_PROCESS lets that child allocate a visible console (#2421).
         kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            | subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
         )
     else:
         kwargs["start_new_session"] = True
@@ -1417,6 +1519,26 @@ def _complete_restarted_update(runtime_home: Path) -> bool:
     if job.status != "restarting" or job.restart_home != str(runtime_home.resolve()):
         return False
     store.mark_succeeded(job.id)
+    return True
+
+
+def _fail_restarted_update(runtime_home: Path, error: str) -> bool:
+    """Record a restart that will not reach readiness, so clients stop waiting.
+
+    Without this, a launcher that exits before ``_complete_restarted_update``
+    leaves the job in ``restarting`` while nothing listens (see #2330).
+    """
+
+    from deeptutor.services.app_update import UpdateJobStore, update_store_root
+
+    store = UpdateJobStore(update_store_root(runtime_home))
+    try:
+        job = store.load()
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+    if job.status != "restarting" or job.restart_home != str(runtime_home.resolve()):
+        return False
+    store.mark_failed(job.id, error)
     return True
 
 
@@ -1592,6 +1714,11 @@ def start(
         "-m",
         "uvicorn",
         "deeptutor.api.main:app",
+        # Uvicorn adds its app-dir to sys.path even with PYTHONSAFEPATH=1.
+        # The runtime home may contain stale source files after an upgrade;
+        # import the backend from the same installation as this launcher.
+        "--app-dir",
+        str(PACKAGE_ROOT),
         "--host",
         "0.0.0.0",
         "--port",
@@ -1618,6 +1745,8 @@ def start(
         # ECONNRESET ("Failed to proxy ... socket hang up" -> 500).
         "--timeout-keep-alive",
         str(HTTP_KEEP_ALIVE_TIMEOUT),
+        "--timeout-graceful-shutdown",
+        "1",
         "--workers",
         str(backend_workers),
     ]
@@ -1626,14 +1755,18 @@ def start(
     backend: ManagedProcess | None = None
     web: ManagedProcess | None = None
     shutdown_requested = False
+    shutdown_wake = threading.Event()
+    force_shutdown = threading.Event()
     cleanup_started = False
     exit_code = 0
 
     def request_shutdown(signal_name: str | None = None) -> None:
         nonlocal shutdown_requested
         if shutdown_requested:
+            force_shutdown.set()
             return
         shutdown_requested = True
+        shutdown_wake.set()
         if signal_name:
             _log(_t("start.received_signal", signal=signal_name))
 
@@ -1651,10 +1784,7 @@ def start(
         if cleanup_started:
             return
         cleanup_started = True
-        try:
-            _terminate(backend)
-        finally:
-            _terminate(web)
+        _terminate_all(processes, force=force_shutdown)
         if detached_paths is not None:
             _clear_detached_runtime(detached_paths, detached_token)
 
@@ -1732,11 +1862,20 @@ def start(
                     exit_code = 1
                     shutdown_requested = True
                     break
-            time.sleep(1)
+            shutdown_wake.wait(1)
     except KeyboardInterrupt:
         request_shutdown("SIGINT")
+    except Exception as exc:
+        _fail_restarted_update(runtime_home, f"Restart failed: {exc}")
+        raise
     finally:
         cleanup()
+        # A clean stop before readiness is still an incomplete update; leave a
+        # durable failure instead of a job that polls forever.
+        _fail_restarted_update(
+            runtime_home,
+            "DeepTutor stopped before the update restart completed.",
+        )
 
     if exit_code:
         raise SystemExit(exit_code)

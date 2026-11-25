@@ -311,6 +311,12 @@ class MasteryInteractionError(RuntimeError):
     """Base error for invalid durable question lifecycle transitions."""
 
 
+_UNINSPECTED_VISUAL_REPAIR = (
+    "This visual practice had no verified pixel inspection. Void it and pose a "
+    "supported replacement; a challenge cannot create mastery evidence."
+)
+
+
 class NoPendingInteractionError(MasteryInteractionError):
     """Raised when grading or resuming without an outstanding question."""
 
@@ -841,8 +847,9 @@ class LearningService:
     ) -> tuple[LearningProgress, MasteryInteraction, bool]:
         """Atomically register one outstanding question.
 
-        Retrying ``mastery_quiz`` while a question is active returns the
-        existing interaction instead of overwriting its expected answer.
+        Retrying within the same session returns the existing interaction.
+        A validated question from a different session archives the old pending
+        interaction. Previously committed answers must be assessed first.
         """
 
         if pending_action not in {"retain", "replace", "resume"}:
@@ -922,7 +929,23 @@ class LearningService:
                 except LessonUnavailable as exc:
                     raise MasteryInteractionError(str(exc)) from exc
                 return active, False
-            if active is not None and pending_action == "retain":
+            new_session = bool(
+                active is not None
+                and session_id
+                and active.session_id
+                and active.session_id != session_id
+            )
+            if active is not None and new_session:
+                reviewed_ids = {
+                    row["question_id"] for row in (active.result or {}).get("results", [])
+                }
+                if (set(active.answers) - reviewed_ids) or (
+                    not active.question.questions and active.status == InteractionStatus.ANSWERED
+                ):
+                    raise MasteryInteractionError(
+                        "Assess the previous session's committed answers before starting a new question."
+                    )
+            if active is not None and pending_action == "retain" and not new_session:
                 if bool(pending.questions) != bool(active.question.questions):
                     raise MasteryInteractionError(
                         "An incompatible question is already pending; retain it or explicitly "
@@ -973,7 +996,7 @@ class LearningService:
                     "interaction.abandoned",
                     {
                         "interaction_id": active.interaction_id,
-                        "reason": "explicit_replacement",
+                        "reason": "new_session" if new_session else "explicit_replacement",
                         "replacement_id": pending.question_id,
                     },
                     session_id=session_id,
@@ -2489,9 +2512,7 @@ class LearningService:
 
                 candidate_answer = str(expected_answer or question.expected_answer)
                 if not question.visual_context.get("pixels_inspected"):
-                    raise MasteryInteractionError(
-                        "This visual practice had no verified pixel inspection. Void it and pose a supported replacement; a challenge cannot create mastery evidence."
-                    )
+                    raise MasteryInteractionError(_UNINSPECTED_VISUAL_REPAIR)
                 try:
                     corrected_visual, corrected_aliases = prepare_visual(
                         {
@@ -2853,20 +2874,22 @@ class LearningService:
                 raise MasteryInteractionError(
                     f"Objective {kp.name!r} must be graded with mastery_quiz + mastery_grade"
                 )
-            from deeptutor.learning.lesson_evidence import LessonUnavailable, validate_evidence
+            from deeptutor.learning.lesson_evidence import (
+                LessonUnavailable,
+                assessment_evidence,
+                validate_evidence,
+            )
 
             try:
-                validate_evidence(
-                    self._store, tx.progress, kp_id, tx.progress.lesson_evidence.get(kp_id, {})
-                )
+                packet = assessment_evidence(tx.progress, kp_id)
+                validate_evidence(self._store, tx.progress, kp_id, packet)
                 if _assessment:
                     from deeptutor.learning.lesson_evidence import objective_fingerprint
                     from deeptutor.learning.semantic_assessment import fingerprint
 
                     if (
                         objective_fingerprint(tx.progress, kp_id) != _assessment["objective"]
-                        or fingerprint(tx.progress.lesson_evidence.get(kp_id, {}))
-                        != _assessment["source"]
+                        or fingerprint(packet) != _assessment["source"]
                     ):
                         raise MasteryInteractionError(
                             "Objective or source changed during assessment; retry."
@@ -2952,6 +2975,7 @@ class LearningService:
             confidence=verdict.get("confidence") if verdict else None,
             learner_answer=evidence,
             feedback=verdict.get("feedback", "") if verdict else "",
+            reference_answer=verdict.get("reference_answer", "") if verdict else "",
             attempt_count=1,
             session_id=session_id,
             turn_id=turn_id,
@@ -3067,6 +3091,7 @@ class LearningService:
         from deeptutor.learning import semantic_assessment as semantic
         from deeptutor.learning.lesson_evidence import (
             LessonUnavailable,
+            assessment_evidence,
             objective_fingerprint,
             validate_evidence,
         )
@@ -3095,8 +3120,22 @@ class LearningService:
                     result=existing.result,
                     confidence=existing.confidence if existing.confidence is not None else 1.0,
                     feedback=existing.feedback or "Previously saved assessment.",
+                    reference_answer=existing.reference_answer,
                 ).receipt()
-        evidence = progress.lesson_evidence.get(kp_id, {})
+        # A reply to a clarification request or to a partial grade completes
+        # the earlier explanation in this session; grading it alone would
+        # mark a full answer partial.
+        pending = ""
+        if session_id:
+            _, pending = self._store.mutate(
+                book_id,
+                lambda tx: tx.pending_explanation(kp_id, session_id=session_id, turn_id=turn_id),
+            )
+        if pending and len(pending) + len(answer) + 2 <= 10000:
+            answer = f"{pending}\n\n{answer}"
+        else:
+            pending = ""
+        evidence = assessment_evidence(progress, kp_id)
         try:
             validate_evidence(self._store, progress, kp_id, evidence)
             objective = objective_fingerprint(progress, kp_id)
@@ -3105,6 +3144,7 @@ class LearningService:
                 [
                     {
                         "question_id": kp_id,
+                        "assessment_type": "qualitative",
                         "prompt": "Explain this objective in your own words: " + kp.name,
                         "expected_answer": "A complete, accurate explanation of the objective and its relationships; do not infer mastery from acknowledgements or requests.",
                         "objective": kp.model_dump(),
@@ -3115,9 +3155,25 @@ class LearningService:
                 ],
             )
         except (semantic.AssessmentUnavailable, LessonUnavailable) as exc:
+            # An infrastructure/source failure is not a learner verdict. Keep
+            # the actual explanation for a later clarification or retry (#2249).
+            if session_id:
+                self._store.mutate(
+                    book_id,
+                    lambda tx: tx.record_pending_explanation(
+                        kp_id, answer, base=pending, session_id=session_id, turn_id=turn_id
+                    ),
+                )
             raise MasteryInteractionError(str(exc)) from exc
         receipt = decisions[kp_id].receipt()
         if not receipt["final"]:
+            if session_id:
+                self._store.mutate(
+                    book_id,
+                    lambda tx: tx.record_pending_explanation(
+                        kp_id, answer, base=pending, session_id=session_id, turn_id=turn_id
+                    ),
+                )
             return progress, receipt
         progress = self.record_qualitative_for_path(
             book_id,
@@ -3131,6 +3187,16 @@ class LearningService:
             },
             **kwargs,
         )
+        if receipt["result"] == "partial" and session_id:
+            # The learner usually answers a partial grade with the missing
+            # part only. Keep what was graded so that reply completes it
+            # instead of being graded alone (and found partial again).
+            self._store.mutate(
+                book_id,
+                lambda tx: tx.record_pending_explanation(
+                    kp_id, answer, base=pending, session_id=session_id, turn_id=turn_id
+                ),
+            )
         return progress, receipt
 
     async def grade_interaction_semantic(self, book_id: str, *, config=None, **kwargs):
@@ -3318,6 +3384,11 @@ class LearningService:
         receipt = None
         try:
             if question.visual_context:
+                if not question.visual_context.get("pixels_inspected"):
+                    # prepare_visual below is not given the original model-input
+                    # hashes, so an uninspected card would fail closed with the
+                    # pixel error and never reach the void guidance (#2494).
+                    raise MasteryInteractionError(_UNINSPECTED_VISUAL_REPAIR)
                 from deeptutor.learning.visual_practice import (
                     prepare_visual,
                     verified_visual_images,

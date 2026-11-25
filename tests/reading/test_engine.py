@@ -35,9 +35,13 @@ from deeptutor.reading.extract import (
     first_line_label,
     split_into_sections,
 )
-from deeptutor.reading.models import parse_text_selectors
+from deeptutor.reading.models import MAX_TEXT_SELECTOR_CHARS, parse_text_selectors
 from deeptutor.reading.search import normalise, search_units, terms_of
 from deeptutor.utils.document_images import MAX_INLINE_IMAGE_EDGE
+from tests.docx_math_fixture import (
+    EXPECTED_EQUATION_PARAGRAPHS,
+    native_equation_docx_bytes,
+)
 
 pymupdf = pytest.importorskip("pymupdf")
 
@@ -251,6 +255,23 @@ def test_uploaded_markdown_with_fewer_than_two_headings_keeps_flat_fallback(
     assert all(row.synthesised is True for row in store.outline(manifest.material_id))
 
 
+@pytest.mark.parametrize(
+    ("name", "content_format"),
+    [("notes.md", "web_markdown"), ("notes.markdown", "web_markdown"), ("notes.txt", "plain_text")],
+)
+def test_uploaded_markdown_renders_as_markdown_and_plain_text_stays_literal(
+    store: ReadingStore, tmp_path: Path, name: str, content_format: str
+) -> None:
+    path = tmp_path / name
+    path.write_text("# Mean\n\nThe mean is $\\bar x$.", encoding="utf-8")
+
+    manifest = store.ingest(path)
+
+    assert manifest.content_format == content_format
+    assert manifest.source_type == "upload"
+    assert store.manifest(manifest.material_id).content_format == content_format
+
+
 def test_epub_preserves_spine_units_source_hrefs_and_nested_outline(tmp_path: Path) -> None:
     extraction = extract_material(_write_epub(tmp_path / "book.epub"))
 
@@ -429,6 +450,20 @@ def test_ingest_writes_units_raw_and_manifest(store: ReadingStore, pdf_path: Pat
     assert store.unit_text(manifest.material_id, 2).find("scaled dot-product") >= 0
     raw = store.raw_path(manifest.material_id)
     assert raw is not None and raw.read_bytes()[:5] == b"%PDF-"
+
+
+def test_ingest_preserves_native_word_equations(store: ReadingStore, tmp_path: Path) -> None:
+    source = tmp_path / "equations.docx"
+    source.write_bytes(native_equation_docx_bytes())
+
+    manifest = store.ingest(source)
+
+    assert manifest.extractor == "docx"
+    assert manifest.unit_count == 1
+    unit = store.unit_text(manifest.material_id, 1)
+    for paragraph in EXPECTED_EQUATION_PARAGRAPHS:
+        assert paragraph in unit
+    assert "Fraction: 12 + 13." not in unit
 
 
 def test_epub_store_keeps_original_but_legacy_pdf_flag_stays_false(
@@ -848,6 +883,120 @@ def test_quote_and_position_selectors_must_identify_the_same_text(
         )
 
 
+def _markdown_store(store: ReadingStore, unit: str) -> str:
+    store.ingest_units(
+        "abcdef0123456789",
+        filename="notes.md",
+        units=[unit],
+        content_format="web_markdown",
+    )
+    return "abcdef0123456789"
+
+
+def test_markdown_positions_are_measured_against_the_rendered_text(
+    store: ReadingStore,
+) -> None:
+    material_id = _markdown_store(
+        store, "A **bold** claim and $x^2$ growth, then a plain tail word."
+    )
+    # What the browser shows, and what rangeToSelector measures against.
+    rendered = "A bold claim and x² growth, then a plain tail word."
+    start = rendered.index("plain tail")
+
+    saved = store.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            selectors=(
+                TextQuoteSelector(
+                    exact="plain tail",
+                    prefix="then a ",
+                    suffix=" word",
+                ),
+                TextPositionSelector(start=start, end=start + len("plain tail")),
+            ),
+        ),
+    )
+
+    assert saved.quote == "plain tail"
+    assert [selector.to_dict() for selector in store.annotations(material_id)[0].selectors] == [
+        {
+            "type": "TextQuoteSelector",
+            "exact": "plain tail",
+            "prefix": "then a ",
+            "suffix": " word",
+        },
+        {"type": "TextPositionSelector", "start": start, "end": start + len("plain tail")},
+    ]
+
+
+def test_markdown_quote_crossing_inline_formatting_is_stored_verbatim(
+    store: ReadingStore,
+) -> None:
+    # "Some bold text" is the rendered wording of "Some **bold** text" — it
+    # cannot occur in the raw unit, yet it is exactly what the reader selected.
+    material_id = _markdown_store(store, "Some **bold** text follows.")
+
+    saved = store.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            selectors=(
+                TextQuoteSelector(exact="Some bold text", suffix=" follows"),
+                TextPositionSelector(start=0, end=len("Some bold text")),
+            ),
+        ),
+    )
+
+    assert saved.quote == "Some bold text"
+    stored_quote = next(
+        selector
+        for selector in store.annotations(material_id)[0].selectors
+        if isinstance(selector, TextQuoteSelector)
+    )
+    assert stored_quote.exact == "Some bold text"
+
+
+def test_markdown_position_selector_without_quote_keeps_the_client_quote(
+    store: ReadingStore,
+) -> None:
+    material_id = _markdown_store(
+        store, "A **bold** claim and $x^2$ growth, then a plain tail word."
+    )
+    rendered = "A bold claim and x² growth, then a plain tail word."
+    start = rendered.index("plain tail")
+
+    saved = store.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            quote="plain tail",
+            selectors=(TextPositionSelector(start=start, end=start + len("plain tail")),),
+        ),
+    )
+
+    assert saved.quote == "plain tail"
+
+
+def test_markdown_position_selector_span_ceiling_still_applies(
+    store: ReadingStore,
+) -> None:
+    material_id = _markdown_store(store, "A plain unit of markdown text.")
+
+    with pytest.raises(ReadingError, match="too long"):
+        store.save_annotation(
+            material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(TextPositionSelector(start=0, end=MAX_TEXT_SELECTOR_CHARS + 1),),
+            ),
+        )
+
+
 def test_saving_the_same_id_updates_in_place_and_keeps_created_at(
     store: ReadingStore, pdf_path: Path
 ) -> None:
@@ -1254,3 +1403,61 @@ def test_state_written_before_the_split_is_still_read(store: ReadingStore, pdf_p
 
     notes = sorted(row.note for row in store.annotations(manifest.material_id))
     assert notes == ["written after the split", "written by the old reader"]
+
+
+@pytest.mark.parametrize("with_selector", [False, True])
+def test_markdown_annotations_reject_fabricated_quotes(
+    store: ReadingStore, with_selector: bool
+) -> None:
+    material_id = _markdown_store(store, "Some **bold** text follows.")
+    selectors = (TextPositionSelector(start=0, end=22),)
+    if with_selector:
+        selectors = (TextQuoteSelector(exact="quantum flux capacitor"), *selectors)
+    with pytest.raises(ReadingError, match="reading unit"):
+        store.save_annotation(
+            material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                quote="quantum flux capacitor",
+                selectors=selectors,
+            ),
+        )
+    assert store.annotations(material_id) == []
+
+
+def test_markdown_annotation_context_is_checked_against_rendered_source(
+    store: ReadingStore,
+) -> None:
+    material_id = _markdown_store(store, "A **bold** phrase follows.")
+    with pytest.raises(ReadingError, match="reading unit"):
+        store.save_annotation(
+            material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(TextQuoteSelector(exact="bold phrase", prefix="Invented "),),
+            ),
+        )
+    saved = store.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            selectors=(TextQuoteSelector(exact="bold phrase", prefix="A ", suffix=" follows"),),
+        ),
+    )
+    assert saved.quote == "bold phrase"
+
+
+def test_markdown_position_only_requires_a_grounded_quote(store: ReadingStore) -> None:
+    material_id = _markdown_store(store, "Some **bold** text follows.")
+    with pytest.raises(ReadingError, match="require a quote"):
+        store.save_annotation(
+            material_id,
+            Annotation(
+                annotation_id="",
+                locator=1,
+                selectors=(TextPositionSelector(start=0, end=3),),
+            ),
+        )

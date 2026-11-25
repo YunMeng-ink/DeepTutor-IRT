@@ -4,9 +4,9 @@ import { pageActionClass, pageGridClass } from '@/components/layout/FeaturePage'
 import Tooltip from "@/shared/ui/Tooltip";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Cpu, Loader2, Plug, Plus, Trash2, X } from "lucide-react";
+import { Cpu, Loader2, Plug, Plus, Trash2, X, Bot } from "lucide-react";
 
-import { agentGlyph } from "@/components/agents/agent-icons";
+import { agentGlyph, agentKindLabel } from "@/components/agents/agent-icons";
 import SpaceSectionHeader from "@/components/space/SpaceSectionHeader";
 import {
   connectSubagent,
@@ -23,25 +23,12 @@ const REMOTE_HERMES_KIND = "hermes_remote";
 
 type Lang = { zh: string; en: string };
 
-function backendLabel(kind: string): string {
-  if (kind === "claude_code") return "Claude Code";
-  if (kind === "codex") return "Codex";
-  if (kind === "grok") return "Grok CLI";
-  if (kind === "antigravity") return "Antigravity CLI";
-  if (kind === "kimi") return "Kimi CLI";
-  if (kind === "opencode") return "opencode";
-  if (kind === "mimo") return "MiMo Code";
-  if (kind === "hermes") return "Hermes Agent";
-  if (kind === REMOTE_HERMES_KIND) return "Hermes Agent (remote)";
-  if (kind === "openclaw") return "OpenClaw";
-  if (kind === "deepseek_harness") return "DeepSeek Harness";
-  return kind;
-}
+const backendLabel = agentKindLabel;
 
 export default function ConnectedAgents() {
-  const { i18n } = useTranslation();
+  const { t, i18n } = useTranslation();
   const zh = i18n.language?.toLowerCase().startsWith("zh");
-  const tr = useCallback((l: Lang) => (zh ? l.zh : l.en), [zh]);
+  const tr = useCallback((l: Lang) => (zh ? l.zh : t(l.en)), [zh, t]);
 
   const [backends, setBackends] = useState<SubagentBackendInfo[]>([]);
   const [connections, setConnections] = useState<SubagentConnection[]>([]);
@@ -77,10 +64,10 @@ export default function ConnectedAgents() {
     async (name: string) => {
       if (
         !window.confirm(
-          tr({
-            zh: `断开「${name}」？这只会移除连接，不影响本机的智能体配置。`,
-            en: `Disconnect “${name}”? This only removes the connection; your local agent is untouched.`,
-          }),
+          t(
+            "Disconnect “{{name}}”? This only removes the connection; your local agent is untouched.",
+            { name },
+          ),
         )
       )
         return;
@@ -92,12 +79,13 @@ export default function ConnectedAgents() {
         setBusyName(null);
       }
     },
-    [load, tr],
+    [load, t],
   );
 
   return (
     <section className="space-y-4">
       <SpaceSectionHeader
+        icon={Bot}
         title={tr({ zh: "连接的智能体", en: "Connected agents" })}
         description={tr({
           zh: "把本机智能体或已配置的远程 Hermes 网关接进来，在对话中选中后直接向它提问——运行过程会实时展示。",

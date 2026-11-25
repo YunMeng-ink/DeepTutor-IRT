@@ -24,6 +24,7 @@ Two execution paths:
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
 import logging
@@ -47,6 +48,7 @@ from deeptutor.services.config.loader import get_capability_params
 from deeptutor.services.llm import clean_thinking_tags, get_llm_config, get_token_limit_kwargs
 from deeptutor.services.llm import stream as llm_stream
 from deeptutor.services.llm.capabilities import threads_session_id
+from deeptutor.services.llm.exceptions import LLMProviderTransportError
 from deeptutor.services.session.provider_response_state import normalize_provider_response_state
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,26 @@ _KIND_BY_PREFIX: dict[str, tuple[str, str]] = {
     "at-": ("Document", "文档"),
 }
 
+# A connected provider that never yields another chunk must settle (#2539).
+# The answer loop already bounds its stream reads
+# (``agent_loop._bounded_stream_chunks``); this pre-pass runs *before* that
+# loop, as a ``pre_loop`` hook, so without its own bound a stalled CLI parks
+# the whole turn in ``running`` — the lease keeps renewing, recovery sees a
+# live owner, and only an explicit cancel frees it.
+_STREAM_IDLE_TIMEOUT_SECONDS = 90.0
+
+
+async def _bounded_stream_chunks(stream: Any):
+    """Yield stream chunks, raising once the provider goes idle for too long."""
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            yield await asyncio.wait_for(iterator.__anext__(), _STREAM_IDLE_TIMEOUT_SECONDS)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            raise LLMProviderTransportError("The model provider stream timed out.") from None
+
 
 @dataclass(slots=True)
 class _CallResult:
@@ -125,6 +147,7 @@ class ContextExplorer:
         self.language = "zh" if str(language or "en").lower().startswith("zh") else "en"
         self._prompts = prompts or {}
         cfg = get_llm_config()
+        self._llm_config = cfg
         self.model = getattr(cfg, "model", None)
         self.api_key = getattr(cfg, "api_key", None)
         self.base_url = getattr(cfg, "base_url", None)
@@ -161,6 +184,18 @@ class ContextExplorer:
         if not source_index:
             return ""
 
+        # Choose before model effects; a native failure never replays through Python.
+        import os
+
+        if os.getenv("DEEPTUTOR_CHAT_ENGINE") == "typescript-native":
+            from deeptutor.runtime.ts_engine.config import compatibility_reason
+
+            tool = self.registry.get("read_source")
+            if not compatibility_reason(self._llm_config) and (
+                tool is not None and type(tool).__module__ == "deeptutor.tools.builtin"
+            ):
+                return await self._investigate_native(context, stream, source_index, usage)
+
         investigation = ""
         if can_use_native_tool_calling(binding=self.binding, model=self.model):
             try:
@@ -181,6 +216,27 @@ class ContextExplorer:
         if not investigation:
             return ""
         return f"{self._briefing_header()}\n\n{investigation}".strip()
+
+    async def _investigate_native(self, context, stream, sources, usage) -> str:
+        from .native import investigate_native
+
+        investigation = ""
+        if can_use_native_tool_calling(binding=self.binding, model=self.model):
+            try:
+                investigation = await investigate_native(self, context, stream, sources, usage)
+            except Exception:
+                logger.warning(
+                    "native source investigation failed; trying read-only briefing", exc_info=True
+                )
+        if not investigation.strip():
+            try:
+                investigation = await investigate_native(
+                    self, context, stream, sources, usage, single_pass=True
+                )
+            except Exception:
+                logger.warning("native source briefing failed", exc_info=True)
+        investigation = clean_thinking_tags(investigation, self.binding, self.model).strip()
+        return f"{self._briefing_header()}\n\n{investigation}" if investigation else ""
 
     # ---- agentic loop ----------------------------------------------------
 
@@ -365,9 +421,15 @@ class ContextExplorer:
         thinking_blocks: list[dict[str, Any]] = []
         tool_acc = ToolCallAccumulator()
         output_chars = 0
-        response_stream = await client.chat.completions.create(**kwargs)
+        # Bound connection setup as well as the idle reads below, the same way
+        # the answer loop does: a provider that hangs while opening the stream
+        # parks the turn just as effectively as one that stalls mid-stream.
+        response_stream = await asyncio.wait_for(
+            client.chat.completions.create(**kwargs),
+            _STREAM_IDLE_TIMEOUT_SECONDS,
+        )
         try:
-            async for chunk in response_stream:
+            async for chunk in _bounded_stream_chunks(response_stream):
                 choices = getattr(chunk, "choices", None) or []
                 if not choices:
                     continue

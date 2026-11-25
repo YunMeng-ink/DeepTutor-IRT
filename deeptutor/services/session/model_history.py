@@ -13,6 +13,10 @@ from typing import Any
 
 MODEL_TURN_KEY = "model_turn"
 MODEL_TURN_VERSION = 1
+# Structured Little Tutor source, written beside ``model_turn`` on the
+# assistant row. Unlike the prompt text, it is a stable identity: the backfill
+# can read it without parsing localized instructions.
+SOURCE_MESSAGE_METADATA_KEY = "selection_source"
 # Exact legacy runtime envelope, not a general delimiter in user text.
 _MASTERY_SNAPSHOT_NOTICE = (
     "[Current-turn mastery_status snapshot]\n"
@@ -130,6 +134,34 @@ def history_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return groups
 
 
+def _without_completed_thinking(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop prefix-bound Anthropic thoughts only at the durable turn boundary.
+
+    Current-turn tool rounds never pass through history replay. Keep their
+    signed state intact, and leave the stored transcript and other providers'
+    replay state untouched.
+    """
+    result = deepcopy(messages)
+    for message in result:
+        if message.get("role") != "assistant":
+            continue
+        message.pop("thinking_blocks", None)
+        state = message.get("_provider_response_state")
+        if isinstance(state, dict):
+            state.pop("thinking_blocks", None)
+            if not state:
+                message.pop("_provider_response_state", None)
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = [
+                block
+                for block in content
+                if not isinstance(block, dict)
+                or block.get("type") not in {"thinking", "redacted_thinking"}
+            ]
+    return result
+
+
 def replay_group(
     rows: list[dict[str, Any]], route: dict[str, str] | None = None
 ) -> list[dict[str, Any]]:
@@ -165,7 +197,7 @@ def replay_group(
                         message.pop(key, None)
                     for call in message.get("tool_calls") or []:
                         call.pop("extra_content", None)
-            return messages
+            return _without_completed_thinking(messages)
     messages = []
     for row in rows:
         expanded = expand_message_context(row)
@@ -177,7 +209,7 @@ def replay_group(
             if state:
                 expanded[-1]["_provider_response_state"] = state
         messages.extend(expanded)
-    return messages
+    return _without_completed_thinking(messages)
 
 
 #: Snapshot name the rolling summary rides under when it is replayed.
@@ -214,26 +246,8 @@ def replay_history(
     messages: list[dict[str, Any]] = []
     for group in history_groups(rows):
         messages.extend(replay_group(group, route))
-    # Runtime snapshots are current state, not learning history. Keep the
-    # latest per section; keep every user exchange and tool protocol pair.
-    latest: dict[str, int] = {}
-    for index, message in enumerate(messages):
-        if message.get("role") != "user":
-            continue
-        name = message.get("_context_snapshot")
-        if isinstance(name, str):
-            latest[name] = index
-    return [
-        message
-        for index, message in enumerate(messages)
-        if not (
-            message.get("role") == "user"
-            and (
-                isinstance(message.get("_context_snapshot"), str)
-                and latest[message["_context_snapshot"]] != index
-            )
-        )
-    ]
+    # Preserve the sent prefix, including snapshots superseded by later updates.
+    return messages
 
 
 def complete_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
