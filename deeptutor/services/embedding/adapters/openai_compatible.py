@@ -270,9 +270,7 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
                     # 429 会连挂 8 轮后仍然 raise，不会无限空转。
                     if rate_limit_retries < 8:
                         rate_limit_retries += 1
-                        retry_after = parse_retry_after_seconds(
-                            response.headers.get("Retry-After")
-                        )
+                        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
                         await asyncio.sleep(max(retry_after or 0.0, 60))
                         try:
                             api_key = self._auth_api_key()
@@ -331,9 +329,8 @@ class OpenAICompatibleEmbeddingAdapter(BaseEmbeddingAdapter):
                             "not support embeddings or the selected model "
                             "may not be an embedding model."
                         )
-                    elif (
-                        "text/html" in content_type.lower()
-                        or body_preview.lstrip().startswith("<")
+                    elif "text/html" in content_type.lower() or body_preview.lstrip().startswith(
+                        "<"
                     ):
                         hint = (
                             " The response was HTML, not JSON — the URL is "
