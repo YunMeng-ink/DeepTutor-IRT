@@ -282,6 +282,23 @@ class TurnApplicationService:
         status = str((event.get("metadata") or {}).get("status") or "completed")
         return status == "completed"
 
+    async def _terminal_done_settled(self, turn_id: str, done_at: float | None) -> bool:
+        """Whether a terminal (non-completed) DONE may be reported as final.
+
+        A FAILED/INTERRUPTED envelope carries no follow-up events, but the turn
+        task still owns its lease until its ``finally`` runs — and that runs
+        after DONE is published. A client that retries on the failed DONE would
+        reach ``_begin_turn_sync`` while the lease is held, be classified as an
+        in-flight turn, and get the failed result replayed instead of a fresh
+        turn (#83a119f94 ordering, completed here).
+
+        Wait for the lease to clear, bounded by the same leak guard as the
+        post-DONE title tail.
+        """
+        if await self.coordinator.get_lease(turn_id) is None:
+            return True
+        return done_at is not None and time.monotonic() - done_at >= self._POST_DONE_MAX_SECONDS
+
     async def subscribe_turn(
         self,
         turn_id: str,
@@ -293,6 +310,7 @@ class TurnApplicationService:
         last_seq = max(0, int(after_seq))
         done = False
         tail_possible = False
+        first_done_at: float | None = None
 
         # Durable replay covers a process/Redis restart. Shared-stream replay
         # then fills the live tail owned by any worker.
@@ -304,13 +322,19 @@ class TurnApplicationService:
             if str(event.get("type") or "") == "done":
                 done = True
                 tail_possible = self._done_has_tail(event)
+                if first_done_at is None:
+                    first_done_at = time.monotonic()
             yield event
         if done and not tail_possible:
-            return
+            # A terminal envelope can still be followed by nothing, but its
+            # turn task has not necessarily released the lease yet; see
+            # _terminal_done_settled.
+            if await self._terminal_done_settled(turn_id, first_done_at):
+                return
         # A completed row can still have an owned title tail. Drain it below,
         # including durable events committed after the initial replay (#1971).
-
-        first_done_at: float | None = time.monotonic() if done else None
+        if done and first_done_at is None:
+            first_done_at = time.monotonic()
         while True:
             emitted = False
             events = await self.coordinator.read_events(turn_id, last_seq)
@@ -331,7 +355,8 @@ class TurnApplicationService:
                         first_done_at = time.monotonic()
                 yield event
             if done and not tail_possible:
-                return
+                if await self._terminal_done_settled(turn_id, first_done_at):
+                    return
             if done:
                 now = time.monotonic()
                 if first_done_at is None:
