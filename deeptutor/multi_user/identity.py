@@ -259,10 +259,13 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
         merged.update(canonical)
         return merged
 
-    # Cache only when the read saw a stable file: a rewrite racing this read
-    # would otherwise be memoized under the stale stamp.
-    if stamp is not None and _users_file_stamp() == stamp:
-        _store_cached_users(stamp, canonical)
+    # Memoize under the stamp the file has *now*. Canonicalization above may
+    # itself rewrite the file (its own ``_write_users`` cleared the memo and
+    # changed the stamp), and the result is canonical either way, so keying on
+    # the pre-read stamp would discard every load the rewrite touched.
+    current = _users_file_stamp()
+    if current is not None:
+        _store_cached_users(current, canonical)
 
     return canonical
 

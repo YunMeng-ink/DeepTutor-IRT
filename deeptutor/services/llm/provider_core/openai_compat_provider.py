@@ -1094,27 +1094,14 @@ class OpenAICompatProvider(LLMProvider):
         tc: Any,
         idx_hint: int = 0,
     ) -> None:
-        """Fold one streamed tool-call delta into the final response buffer."""
-        tc_index: int = _get(tc, "index") if _get(tc, "index") is not None else idx_hint
-        buf = tc_bufs.setdefault(
-            tc_index,
-            {
-                "id": "",
-                "name": "",
-                "arguments": "",
-            },
-        )
-        tc_id = _get(tc, "id")
-        if tc_id:
-            buf["id"] = str(tc_id)
-        fn = _get(tc, "function")
-        if fn is not None:
-            fn_name = _get(fn, "name")
-            if fn_name:
-                buf["name"] = str(fn_name)
-            fn_args = _get(fn, "arguments")
-            if fn_args:
-                buf["arguments"] += str(fn_args)
+        """Fold one streamed tool-call delta into the final response buffer.
+
+        Delegates to the id-addressed accumulator: providers that send no
+        ``index`` are told apart by ``id``, and an id-less fragment continues
+        the last addressed call. Falling back to ``idx_hint`` alone merged
+        parallel calls from such providers into one buffer.
+        """
+        _accumulate_streamed_tool_call(tc_bufs, tc)
 
     @staticmethod
     def _build_streamed_response(
@@ -1133,7 +1120,9 @@ class OpenAICompatProvider(LLMProvider):
                     name=b["name"],
                     arguments=json_repair.loads(b["arguments"]) if b["arguments"] else {},
                 )
-                for b in tc_bufs.values()
+                # Sorted slots: `_tool_call_slot` reorders buffers by recency,
+                # which must not reorder the calls in the final response.
+                for _, b in sorted(tc_bufs.items())
             ],
             finish_reason=finish_reason,
             usage=usage,

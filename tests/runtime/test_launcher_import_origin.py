@@ -111,7 +111,11 @@ def test_backend_imports_launcher_installation_despite_stale_runtime_home(
     observed: dict = {}
 
     def spawn_loopback(command, *, cwd, env, name):
-        assert name == "backend"
+        # The launcher boots both children up front, so this wraps the
+        # frontend spawn too; only the backend carries the assertion and the
+        # loopback rewrite.
+        if name != "backend":
+            return spawn(command, cwd=cwd, env=env, name=name)
         assert cwd == home
         command = list(command)
         command[command.index("--host") + 1] = "127.0.0.1"
