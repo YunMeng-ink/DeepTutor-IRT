@@ -380,7 +380,7 @@ async def test_get_last_message_reads_only_one_row(fake_pb, monkeypatch, role) -
     expected_filter = 'session_id="s_latest"'
     if role:
         expected_filter += f' && role="{role}"'
-    assert reads == [(1, 1, {"filter": expected_filter, "sort": "-msg_created_at"})]
+    assert reads == [(1, 1, {"filter": expected_filter, "sort": "-msg_created_at,-created"})]
     if role == "system":
         assert last is None
     else:

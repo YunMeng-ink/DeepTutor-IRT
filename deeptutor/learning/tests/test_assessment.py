@@ -234,8 +234,20 @@ def test_reanswer_keeps_immutable_attempts_and_updates_latest_projection(
 
 def test_old_submission_retry_cannot_overwrite_newer_answer(store: SQLiteSessionStore) -> None:
     asyncio.run(store.create_session(title="S", session_id="session-1"))
-    wrong = _mastery_record(attempt_id="old", user_answer="3", result="incorrect")
-    right = _mastery_record(attempt_id="new", user_answer="4", result="correct", is_correct=True)
+    # `occurred_at` comes from `created_at`, and the store breaks ties by the
+    # hashed attempt id. Give the two records explicit, ordered timestamps so
+    # the assertion tests "an older attempt cannot rewind the card" rather
+    # than which sha1 sorts higher.
+    wrong = _mastery_record(
+        attempt_id="old", user_answer="3", result="incorrect", created_at=1_000.0
+    )
+    right = _mastery_record(
+        attempt_id="new",
+        user_answer="4",
+        result="correct",
+        is_correct=True,
+        created_at=1_001.0,
+    )
     asyncio.run(record_assessment(wrong))
     asyncio.run(record_assessment(right))
     retried = asyncio.run(record_assessment(wrong))

@@ -89,9 +89,15 @@ def test_sqlite_store_migrates_legacy_chat_history_db(tmp_path: Path) -> None:
         service._user_data_dir = tmp_path / "data" / "user"
         legacy_db = tmp_path / "data" / "chat_history.db"
         legacy_db.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(legacy_db) as conn:
+        conn = sqlite3.connect(legacy_db)
+        try:
             conn.execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
             conn.commit()
+        finally:
+            # sqlite3's context manager only commits; it does not close. On
+            # Windows an open handle keeps the file present after the move,
+            # so close explicitly.
+            conn.close()
 
         store = SQLiteSessionStore()
 

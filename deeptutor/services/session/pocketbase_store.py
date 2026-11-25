@@ -1082,7 +1082,12 @@ class PocketBaseSessionStore:
                     1,
                     query_params={
                         "filter": filter_str,
-                        "sort": "-msg_created_at",
+                        # `msg_created_at` is a float written from one clock
+                        # reading per call, so messages stored within the same
+                        # tick tie. `-created` breaks the tie by record order;
+                        # without it the "last message" is whichever tied row
+                        # the backend happens to return first.
+                        "sort": "-msg_created_at,-created",
                     },
                 )
             )
